@@ -1,4 +1,6 @@
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Handle, Icon, MenuItem, ToolTip, Tray, TrayService};
@@ -327,17 +329,66 @@ impl Tray for MaterialYouTray {
     }
 }
 
-/// Spawn the `ksni` StatusNotifierItem service in a background thread and return
-/// the tray `Handle<MaterialYouTray>` along with the `Receiver<TrayCommand>`.
+/// Resilient wrapper around `ksni::Handle<MaterialYouTray>` that survives
+/// D-Bus registration retries if `org.kde.StatusNotifierWatcher` is not yet
+/// ready at KDE Plasma login or restarts mid-session.
+#[derive(Clone)]
+pub struct TrayHandle {
+    inner: Arc<Mutex<Handle<MaterialYouTray>>>,
+}
+
+impl TrayHandle {
+    /// Update the underlying `MaterialYouTray` model and notify `ksni`.
+    pub fn update<R, F: FnOnce(&mut MaterialYouTray) -> R>(&self, f: F) -> R {
+        let guard = self.inner.lock().unwrap();
+        guard.update(f)
+    }
+
+    /// Shut down the underlying `ksni` tray service.
+    pub fn shutdown(&self) {
+        let guard = self.inner.lock().unwrap();
+        guard.shutdown();
+    }
+}
+
+/// Spawn the `ksni` StatusNotifierItem service in a supervised background thread and return
+/// the resilient `TrayHandle` along with the `Receiver<TrayCommand>`.
+///
+/// Unlike `TrayService::spawn` (which calls `.unwrap()` and panics if D-Bus times out during
+/// KDE Plasma startup), this supervisor loop catches D-Bus errors and retries every 2 seconds.
 pub fn spawn_tray(
     config: AppConfig,
     seed_color_hex: String,
-) -> (Handle<MaterialYouTray>, Receiver<TrayCommand>) {
+) -> (TrayHandle, Receiver<TrayCommand>) {
     let (tx, rx) = mpsc::channel();
     let tray = MaterialYouTray::new(config, seed_color_hex, tx);
-    let service = TrayService::new(tray);
-    let handle = service.handle();
-    service.spawn();
+    let initial_service = TrayService::new(tray);
+    let handle = TrayHandle {
+        inner: Arc::new(Mutex::new(initial_service.handle())),
+    };
+    let handle_for_thread = handle.clone();
+
+    std::thread::spawn(move || {
+        let mut service = initial_service;
+        loop {
+            match service.run() {
+                Ok(()) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        "StatusNotifierItem D-Bus registration/loop failed ({err}); retrying in 2s..."
+                    );
+                    std::thread::sleep(Duration::from_secs(2));
+                    let snapshot = handle_for_thread.update(|t| t.clone());
+                    let next_service = TrayService::new(snapshot);
+                    if let Ok(mut guard) = handle_for_thread.inner.lock() {
+                        *guard = next_service.handle();
+                    }
+                    service = next_service;
+                }
+            }
+        }
+    });
+
     (handle, rx)
 }
 

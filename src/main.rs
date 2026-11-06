@@ -97,7 +97,7 @@ async fn execute_theme_cycle(
     appletsrc_path: &Path,
     potd_cache_dir: &Path,
 ) -> Result<MaterialYouScheme> {
-    let effective_light = resolve_effective_light_mode(config, paths);
+    let mut effective_light = resolve_effective_light_mode(config, paths);
     let mut effective_config = config.clone();
     effective_config.light = Some(effective_light);
     if effective_config.pywal_light.is_none() {
@@ -108,9 +108,35 @@ async fn execute_theme_cycle(
         wallpaper::resolve_wallpaper_async(&effective_config, appletsrc_path, potd_cache_dir)
             .await?;
 
+    // Re-check effective light mode right after wallpaper resolution/decoding in case
+    // an external daylight daemon (e.g. wallpaper-switcher-plasma or knighttimed) updated
+    // ColorScheme in ~/.config/kdeglobals concurrently during startup.
+    let latest_light = resolve_effective_light_mode(config, paths);
+    if latest_light != effective_light {
+        effective_light = latest_light;
+        effective_config.light = Some(effective_light);
+        if config.pywal_light.is_none() {
+            effective_config.pywal_light = Some(effective_light);
+        }
+    }
+
     let req = build_scheme_request(&effective_config, &wallpaper_source, effective_light);
     let mut scheme = MaterialYouScheme::generate(&req)?;
     scheme.wallpaper = wallpaper_source.to_wallpaper_info();
+
+    // Final check before writing kdeglobals / running plasma-apply-colorscheme
+    let pre_apply_light = resolve_effective_light_mode(config, paths);
+    if pre_apply_light != effective_light {
+        effective_light = pre_apply_light;
+        effective_config.light = Some(effective_light);
+        if config.pywal_light.is_none() {
+            effective_config.pywal_light = Some(effective_light);
+        }
+        let updated_req =
+            build_scheme_request(&effective_config, &wallpaper_source, effective_light);
+        scheme = MaterialYouScheme::generate(&updated_req)?;
+        scheme.wallpaper = wallpaper_source.to_wallpaper_info();
+    }
 
     let _ = dbus_client::start_kwin_blend_changes().await;
     let applied = apply_all_themes(&scheme, &effective_config, paths, true)?;
@@ -179,11 +205,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let pid_file = dbus_client::default_pid_file_path();
+
     if cli.gui {
+        let daemon_running = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(dbus_client::is_pid_alive)
+            .unwrap_or(false);
+        if !daemon_running {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = Command::new(exe).spawn();
+            }
+        }
         return gui::run_settings_window(config_path, paths.runtime_json_path());
     }
 
-    let pid_file = dbus_client::default_pid_file_path();
     let _instance_guard = match dbus_client::signal_existing_or_acquire(&pid_file, cli.stop)? {
         InstanceAction::StoppedExisting(Some(pid)) => {
             tracing::info!("Stopped running kde-material-you-colors daemon (PID {pid})");
@@ -219,6 +256,15 @@ async fn main() -> Result<()> {
     let potd_cache_dir = wallpaper::default_potd_cache_dir()
         .unwrap_or_else(|| paths.cache_dir.join("plasma_engine_potd"));
 
+    // Start filesystem watchers BEFORE the initial theme cycle so no concurrent
+    // kdeglobals or wallpaper changes during login are missed.
+    let watcher = ConfigAndWallpaperWatcher::new(
+        config_path.clone(),
+        appletsrc_path.clone(),
+        paths.kdeglobals_path(),
+        _instance_guard.reload_file().to_path_buf(),
+    )?;
+
     let mut current_seed = "#4285f4".to_string();
     if !config.pause_mode {
         match execute_theme_cycle(&config, &paths, &appletsrc_path, &potd_cache_dir).await {
@@ -237,12 +283,6 @@ async fn main() -> Result<()> {
     }
 
     let (tray_handle, tray_rx) = tray::spawn_tray(config.clone(), current_seed.clone());
-    let watcher = ConfigAndWallpaperWatcher::new(
-        config_path.clone(),
-        appletsrc_path.clone(),
-        paths.kdeglobals_path(),
-        _instance_guard.reload_file().to_path_buf(),
-    )?;
 
     let mut last_config_sha1 = AppConfig::sha1_file(&config_path);
     let mut last_effective_light = resolve_effective_light_mode(&config, &paths);
