@@ -3,5 +3,7 @@ pub mod cli;
 pub mod color;
 pub mod config;
 pub mod dbus_client;
+pub mod gui;
 pub mod scheme;
+pub mod tray;
 pub mod wallpaper;
