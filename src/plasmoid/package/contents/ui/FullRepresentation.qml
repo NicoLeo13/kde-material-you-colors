@@ -29,7 +29,7 @@ ColumnLayout {
 
     property string execName: 'kde-material-you-colors'
     property string execPath: ""
-    property string checkBackendCommand: 'ps -o user:256,pid,cmd -C ' + execName + ' --no-headers | grep -e "' + username + '" | grep -v "<defunct>" | grep -ve "--version" | awk \'{print $2}\''
+    property string checkBackendCommand: 'ps -u "' + username + '" -o pid=,cmd= | grep -F "' + execName + '" | grep -v "grep" | grep -v "<defunct>" | grep -ve "--version" | awk \'{print $1}\''
     property string startBackendCommand: execPath
     property string autoStartBackendCommand: execPath + ' --autostart;' + execPath
     property string backendVersionCommand: execPath + ' --version'
@@ -555,6 +555,7 @@ ColumnLayout {
                                     property bool sierra_breeze_buttons_color: false; \
                                     property bool klassy_windeco_outline: false; \
                                     property bool titlebar_opacity_override: false; \
+                                    property bool toolbar_opacity_override: false; \
                                     property string darker_window_list; \
                                     property string on_change_hook; \
                                     property string gui_custom_exec_location; \
@@ -749,7 +750,7 @@ ColumnLayout {
                                 PlasmaExtras.Heading {
                                     level: 1
                                     text: "Colors source"
-                                    anchors.centerIn: parent
+                                    Layout.alignment: Qt.AlignHCenter
                                 }
 
                                 ToolButton { // PlasmaComponents3 one doesnt take colors??
@@ -770,6 +771,9 @@ ColumnLayout {
                                         y: parent.height
                                         text: "Tap to show"
                                     }
+                                }
+                                Item {
+                                    Layout.fillWidth: true
                                 }
                             }
 
@@ -972,7 +976,7 @@ ColumnLayout {
                                     id: headingTextColors
                                     level: 1
                                     text: "Text colors"
-                                    anchors.centerIn: parent
+                                    Layout.alignment: Qt.AlignHCenter
                                 }
 
                                 PlasmaComponents3.ToolButton {
@@ -982,7 +986,6 @@ ColumnLayout {
 
                                     hoverEnabled: true
                                     onClicked: textColorsHelpPopup.show()
-                                    anchors.left: headingTextColors.right
 
                                     PlasmaComponents3.ToolTip {
                                         id: textColorsHelpPopup
@@ -990,6 +993,9 @@ ColumnLayout {
                                         y: textColorsHelpBtn.height
                                         text: "Applies to <strong>Konsole</strong>, <strong>Pywal</strong>, <strong>KSyntaxHighlighting</strong>"
                                     }
+                                }
+                                Item {
+                                    Layout.fillWidth: true
                                 }
                             }
 
@@ -1024,7 +1030,7 @@ ColumnLayout {
                                         Layout.preferredHeight: controlHeight
                                         Layout.preferredWidth: controlWidth
                                         property var colorList: settings.custom_colors_list ? settings.custom_colors_list : settings.custom_colors_list_last
-                                        color: colorList.split(" ")[index]
+                                        color: (colorList ? colorList.split(" ")[index] : "") || "#000000"
 
                                         onAccepted: {
                                             let colors = settings.custom_colors_list.split(" ");
@@ -1111,7 +1117,7 @@ ColumnLayout {
                                     id: headingDarkMode
                                     level: 1
                                     text: "Dark mode"
-                                    anchors.centerIn: parent
+                                    Layout.alignment: Qt.AlignHCenter
                                 }
 
                                 PlasmaComponents3.ToolButton {
@@ -1121,7 +1127,6 @@ ColumnLayout {
 
                                     hoverEnabled: true
                                     onClicked: darkModeHelpPopup.open()
-                                    anchors.left: headingDarkMode.right
 
                                     PlasmaComponents3.ToolTip {
                                         id: darkModeHelpPopup
@@ -1129,6 +1134,9 @@ ColumnLayout {
                                         y: darkModeHelpBtn.height
                                         text: "<strong>Follow color scheme</strong> applies only for Material You color schemes when changed by you or other programs"
                                     }
+                                }
+                                Item {
+                                    Layout.fillWidth: true
                                 }
                             }
                             // Headings

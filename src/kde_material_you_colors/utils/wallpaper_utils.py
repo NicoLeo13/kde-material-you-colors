@@ -265,7 +265,7 @@ def get_wallpaper_config(monitor=0):
             raise ValueError(f"Wallpaper DBus API says: {dbus_output}")
         return dbus_output
     except ValueError as e:
-        logging.exception(e)
+        logging.warning(e)
         raise
 
 

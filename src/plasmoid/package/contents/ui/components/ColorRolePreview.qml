@@ -10,7 +10,7 @@ Rectangle {
     property var scheme
     Layout.fillWidth: true
     implicitHeight: col.implicitHeight + Kirigami.Units.mediumSpacing
-    color: scheme[root.role]
+    color: (root.scheme && root.scheme[root.role]) ? root.scheme[root.role] : "transparent"
     ColumnLayout {
         id: col
         spacing: 0
@@ -21,15 +21,15 @@ Rectangle {
             Layout.rightMargin: Kirigami.Units.smallSpacing
             Text {
                 text: root.customName !== "" ? `${root.customName}` : `${root.role}`
-                color: root.scheme[root.onRole]
+                color: (root.scheme && root.scheme[root.onRole]) ? root.scheme[root.onRole] : Kirigami.Theme.textColor
                 font.bold: true
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize
                 elide: Text.ElideRight
                 Layout.fillWidth: true
             }
             Text {
-                text: `${root.scheme[root.role]}`
-                color: root.scheme[root.onRole]
+                text: `${(root.scheme && root.scheme[root.role]) ? root.scheme[root.role] : ""}`
+                color: (root.scheme && root.scheme[root.onRole]) ? root.scheme[root.onRole] : Kirigami.Theme.textColor
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 Layout.alignment: Qt.AlignRight
                 opacity: 0.7
@@ -42,15 +42,15 @@ Rectangle {
             Layout.rightMargin: Kirigami.Units.smallSpacing
             Text {
                 text: `${root.onRole}`
-                color: root.scheme[root.onRole]
+                color: (root.scheme && root.scheme[root.onRole]) ? root.scheme[root.onRole] : Kirigami.Theme.textColor
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 opacity: root.customName === ""
                 Layout.fillWidth: true
                 elide: Text.ElideRight
             }
             Text {
-                text: `${root.scheme[root.onRole]}`
-                color: root.scheme[root.onRole]
+                text: `${(root.scheme && root.scheme[root.onRole]) ? root.scheme[root.onRole] : ""}`
+                color: (root.scheme && root.scheme[root.onRole]) ? root.scheme[root.onRole] : Kirigami.Theme.textColor
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 Layout.alignment: Qt.AlignRight
                 opacity: 0.7

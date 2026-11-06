@@ -266,9 +266,10 @@ def wide_argparse_help(formatter, help_column: int = 30, min_width: int = 100):
         # try to get terminal width from interactive shells
         columns = None
         try:
-            columns = int(os.popen("stty size", "r").read().split()[1])
-            if columns < min_width:
-                help_column = 4
+            if sys.stdin is not None and sys.stdin.isatty():
+                columns = int(os.popen("stty size", "r").read().split()[1])
+                if columns < min_width:
+                    help_column = 4
         except Exception:
             pass
 

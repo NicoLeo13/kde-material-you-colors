@@ -9,9 +9,9 @@ ColumnLayout {
     property var mdc: ({})
     Layout.alignment: Qt.AlignHCenter
     spacing: Kirigami.Units.mediumSpacing
-    readonly property bool light: mdc.light ?? false
+    readonly property bool light: (mdc && mdc.light) ?? false
     readonly property string theme: light ? "light" : "dark"
-    property var scheme: r.mdc.schemes[r.theme]
+    property var scheme: (r.mdc && r.mdc.schemes) ? r.mdc.schemes[r.theme] : ({})
 
     PlasmaExtras.Heading {
         level: 4
@@ -273,7 +273,8 @@ ColumnLayout {
         Repeater {
             model: {
                 let pairs = [];
-                for (const key of Object.keys(r.mdc.custom)) {
+                const customObj = (r.mdc && r.mdc.custom) ? r.mdc.custom : ({});
+                for (const key of Object.keys(customObj)) {
                     pairs.push({
                         name: key,
                         role: "color",
@@ -291,7 +292,7 @@ ColumnLayout {
                 required property var modelData
                 role: modelData.role
                 onRole: modelData.onRole
-                scheme: r.mdc.custom[modelData.name][r.theme]
+                scheme: (r.mdc && r.mdc.custom && r.mdc.custom[modelData.name]) ? r.mdc.custom[modelData.name][r.theme] : ({})
                 customName: `${modelData.name}`
             }
         }
