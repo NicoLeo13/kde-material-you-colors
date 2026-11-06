@@ -403,12 +403,12 @@ pub fn parse_appletsrc_wallpaper(content: &str, monitor: u32) -> Option<Wallpape
     parse_appletsrc_wallpaper_with_context(content, monitor, default_cache.as_deref(), false)
 }
 
-/// Read `kdeglobals` to determine whether the active Plasma color scheme is in light mode,
-/// matching `plasma_utils.py:110-171`:
-/// 1. `[General] ColorScheme` containing `MaterialYouLight` -> `Some(true)`
-/// 2. `[General] ColorScheme` containing `MaterialYouDark` -> `Some(false)`
-/// 3. `[General] ColorSchemeHash` matching SHA-1 of `light_scheme_path` -> `Some(true)`
-/// 4. `[General] ColorSchemeHash` matching SHA-1 of `dark_scheme_path` -> `Some(false)`
+/// Read `kdeglobals` to determine whether the active Plasma color scheme is in light mode:
+/// 1. `[General] ColorScheme` containing "light" -> `Some(true)` (e.g. `MaterialYouLight`, `BreezeLight`)
+///    `[General] ColorScheme` containing "dark" -> `Some(false)` (e.g. `MaterialYouDark`, `BreezeDark`)
+/// 2. `[General] ColorSchemeHash` matching SHA-1 of `dark_scheme_path` -> `Some(false)`
+///    `[General] ColorSchemeHash` matching SHA-1 of `light_scheme_path` -> `Some(true)`
+/// 3. Fallback to `[Colors:Window] BackgroundNormal` relative luminance (`> 0.18` -> `Some(true)`, else `Some(false)`)
 pub fn read_kdeglobals_light_mode(
     kdeglobals_path: &Path,
     light_scheme_path: &Path,
@@ -416,8 +416,10 @@ pub fn read_kdeglobals_light_mode(
 ) -> Option<bool> {
     let content = std::fs::read_to_string(kdeglobals_path).ok()?;
     let mut in_general = false;
+    let mut in_colors_window = false;
     let mut color_scheme: Option<String> = None;
     let mut color_scheme_hash: Option<String> = None;
+    let mut background_normal: Option<String> = None;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -425,8 +427,9 @@ pub fn read_kdeglobals_light_mode(
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            let section = &line[1..line.len() - 1];
-            in_general = section.trim() == "General";
+            let section = line[1..line.len() - 1].trim();
+            in_general = section.eq_ignore_ascii_case("General");
+            in_colors_window = section.eq_ignore_ascii_case("Colors:Window");
             continue;
         }
         if in_general {
@@ -437,18 +440,27 @@ pub fn read_kdeglobals_light_mode(
                     _ => {}
                 }
             }
+        } else if in_colors_window {
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("BackgroundNormal") {
+                    background_normal = Some(v.trim().to_string());
+                }
+            }
         }
     }
 
+    // 1. Check ColorScheme name for generic Light / Dark patterns
     if let Some(ref scheme) = color_scheme {
-        if scheme.contains("MaterialYouLight") {
+        let lower = scheme.to_ascii_lowercase();
+        if lower.contains("light") {
             return Some(true);
         }
-        if scheme.contains("MaterialYouDark") {
+        if lower.contains("dark") {
             return Some(false);
         }
     }
 
+    // 2. Check ColorSchemeHash against generated dark / light theme files
     if let Some(ref hash) = color_scheme_hash {
         if !hash.is_empty() {
             if let Some(dark_sha1) = AppConfig::sha1_file(dark_scheme_path) {
@@ -460,6 +472,29 @@ pub fn read_kdeglobals_light_mode(
                 if hash.eq_ignore_ascii_case(&light_sha1) {
                     return Some(true);
                 }
+            }
+        }
+    }
+
+    // 3. Fallback to [Colors:Window] BackgroundNormal relative luminance
+    if let Some(ref bg_normal) = background_normal {
+        if let Some(hex) = normalize_color(bg_normal) {
+            let lum = crate::color::color_luminance(&hex);
+            return Some(lum > 0.18);
+        }
+        let parts: Vec<&str> = bg_normal
+            .split([',', ' ', '\t'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() == 3 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                parts[0].parse::<u8>(),
+                parts[1].parse::<u8>(),
+                parts[2].parse::<u8>(),
+            ) {
+                let hex = crate::color::rgb_to_hex(r, g, b);
+                let lum = crate::color::color_luminance(&hex);
+                return Some(lum > 0.18);
             }
         }
     }
@@ -1060,6 +1095,73 @@ Category=
         assert_eq!(
             read_kdeglobals_light_mode(&kdeglobals, &light_scheme, &dark_scheme),
             None
+        );
+    }
+
+    #[test]
+    fn test_read_kdeglobals_light_mode_generic_schemes_and_window_background() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kdeglobals = dir.path().join("kdeglobals");
+        let light_scheme = dir.path().join("dummy_light.colors");
+        let dark_scheme = dir.path().join("dummy_dark.colors");
+        std::fs::write(&light_scheme, "").unwrap();
+        std::fs::write(&dark_scheme, "").unwrap();
+
+        // 1. Generic KDE BreezeLight scheme
+        std::fs::write(&kdeglobals, "[General]\nColorScheme=BreezeLight\n").unwrap();
+        assert_eq!(
+            read_kdeglobals_light_mode(&kdeglobals, &light_scheme, &dark_scheme),
+            Some(true)
+        );
+
+        // 2. Generic KDE BreezeDark scheme
+        std::fs::write(&kdeglobals, "[General]\nColorScheme=BreezeDark\n").unwrap();
+        assert_eq!(
+            read_kdeglobals_light_mode(&kdeglobals, &light_scheme, &dark_scheme),
+            Some(false)
+        );
+
+        // 3. Custom scheme with light [Colors:Window] BackgroundNormal (RGB format)
+        std::fs::write(
+            &kdeglobals,
+            "[General]\nColorScheme=CustomTheme\n\n[Colors:Window]\nBackgroundNormal=239,240,241\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_kdeglobals_light_mode(&kdeglobals, &light_scheme, &dark_scheme),
+            Some(true)
+        );
+
+        // 4. Custom scheme with dark [Colors:Window] BackgroundNormal (RGB format)
+        std::fs::write(
+            &kdeglobals,
+            "[General]\nColorScheme=CustomTheme\n\n[Colors:Window]\nBackgroundNormal=24,26,31\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_kdeglobals_light_mode(&kdeglobals, &light_scheme, &dark_scheme),
+            Some(false)
+        );
+
+        // 5. Custom scheme with hex format in [Colors:Window] BackgroundNormal
+        std::fs::write(
+            &kdeglobals,
+            "[General]\nColorScheme=CustomTheme\n\n[Colors:Window]\nBackgroundNormal=#eff0f1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_kdeglobals_light_mode(&kdeglobals, &light_scheme, &dark_scheme),
+            Some(true)
+        );
+
+        std::fs::write(
+            &kdeglobals,
+            "[General]\nColorScheme=CustomTheme\n\n[Colors:Window]\nBackgroundNormal=#181a1f\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_kdeglobals_light_mode(&kdeglobals, &light_scheme, &dark_scheme),
+            Some(false)
         );
     }
 
