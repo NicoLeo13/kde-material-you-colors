@@ -404,11 +404,11 @@ pub fn parse_appletsrc_wallpaper(content: &str, monitor: u32) -> Option<Wallpape
 }
 
 /// Read `kdeglobals` to determine whether the active Plasma color scheme is in light mode:
-/// 1. `[General] ColorScheme` containing "light" -> `Some(true)` (e.g. `MaterialYouLight`, `BreezeLight`)
-///    `[General] ColorScheme` containing "dark" -> `Some(false)` (e.g. `MaterialYouDark`, `BreezeDark`)
-/// 2. `[General] ColorSchemeHash` matching SHA-1 of `dark_scheme_path` -> `Some(false)`
-///    `[General] ColorSchemeHash` matching SHA-1 of `light_scheme_path` -> `Some(true)`
-/// 3. Fallback to `[Colors:Window] BackgroundNormal` relative luminance (`> 0.18` -> `Some(true)`, else `Some(false)`)
+/// 1. Non-MaterialYou `[General] ColorScheme` containing "light" -> `Some(true)`, "dark" -> `Some(false)`
+/// 2. `[KDE] LookAndFeelPackage` (matched against DefaultDark/DefaultLight or contains dark/light)
+/// 3. `MaterialYou*` `[General] ColorScheme` fallback when LookAndFeelPackage is not set
+/// 4. `[General] ColorSchemeHash` matching SHA-1 of dark / light theme files
+/// 5. Fallback to `[Colors:Window] BackgroundNormal` relative luminance (`> 0.18` -> `Some(true)`, else `Some(false)`)
 pub fn read_kdeglobals_light_mode(
     kdeglobals_path: &Path,
     light_scheme_path: &Path,
@@ -416,10 +416,14 @@ pub fn read_kdeglobals_light_mode(
 ) -> Option<bool> {
     let content = std::fs::read_to_string(kdeglobals_path).ok()?;
     let mut in_general = false;
+    let mut in_kde = false;
     let mut in_colors_window = false;
     let mut color_scheme: Option<String> = None;
     let mut color_scheme_hash: Option<String> = None;
     let mut background_normal: Option<String> = None;
+    let mut look_and_feel_package: Option<String> = None;
+    let mut default_light_lnf: Option<String> = None;
+    let mut default_dark_lnf: Option<String> = None;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -429,6 +433,7 @@ pub fn read_kdeglobals_light_mode(
         if line.starts_with('[') && line.ends_with(']') {
             let section = line[1..line.len() - 1].trim();
             in_general = section.eq_ignore_ascii_case("General");
+            in_kde = section.eq_ignore_ascii_case("KDE");
             in_colors_window = section.eq_ignore_ascii_case("Colors:Window");
             continue;
         }
@@ -440,6 +445,18 @@ pub fn read_kdeglobals_light_mode(
                     _ => {}
                 }
             }
+        } else if in_kde {
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim();
+                let val = v.trim();
+                if key.eq_ignore_ascii_case("LookAndFeelPackage") {
+                    look_and_feel_package = Some(val.to_string());
+                } else if key.eq_ignore_ascii_case("DefaultLightLookAndFeel") {
+                    default_light_lnf = Some(val.to_string());
+                } else if key.eq_ignore_ascii_case("DefaultDarkLookAndFeel") {
+                    default_dark_lnf = Some(val.to_string());
+                }
+            }
         } else if in_colors_window {
             if let Some((k, v)) = line.split_once('=') {
                 if k.trim().eq_ignore_ascii_case("BackgroundNormal") {
@@ -449,18 +466,54 @@ pub fn read_kdeglobals_light_mode(
         }
     }
 
-    // 1. Check ColorScheme name for generic Light / Dark patterns
+    // 1. Check non-MaterialYou [General] ColorScheme (e.g. BreezeLight, BreezeDark)
     if let Some(ref scheme) = color_scheme {
-        let lower = scheme.to_ascii_lowercase();
-        if lower.contains("light") {
+        let scheme_lower = scheme.to_ascii_lowercase();
+        if !scheme_lower.starts_with("materialyou") {
+            if scheme_lower.contains("light") {
+                return Some(true);
+            }
+            if scheme_lower.contains("dark") {
+                return Some(false);
+            }
+        }
+    }
+
+    // 2. Check [KDE] LookAndFeelPackage when ColorScheme is MaterialYou* or unset
+    if let Some(ref lnf) = look_and_feel_package {
+        if !lnf.is_empty() {
+            if let Some(ref dark_lnf) = default_dark_lnf {
+                if !dark_lnf.is_empty() && lnf.eq_ignore_ascii_case(dark_lnf) {
+                    return Some(false);
+                }
+            }
+            if let Some(ref light_lnf) = default_light_lnf {
+                if !light_lnf.is_empty() && lnf.eq_ignore_ascii_case(light_lnf) {
+                    return Some(true);
+                }
+            }
+            let lnf_lower = lnf.to_ascii_lowercase();
+            if lnf_lower.contains("dark") {
+                return Some(false);
+            }
+            if lnf_lower.contains("light") || lnf_lower == "org.kde.breeze.desktop" {
+                return Some(true);
+            }
+        }
+    }
+
+    // 3. MaterialYou* [General] ColorScheme fallback when [KDE] LookAndFeelPackage is not set
+    if let Some(ref scheme) = color_scheme {
+        let scheme_lower = scheme.to_ascii_lowercase();
+        if scheme_lower.contains("light") {
             return Some(true);
         }
-        if lower.contains("dark") {
+        if scheme_lower.contains("dark") {
             return Some(false);
         }
     }
 
-    // 2. Check ColorSchemeHash against generated dark / light theme files
+    // 4. Check ColorSchemeHash against generated dark / light theme files
     if let Some(ref hash) = color_scheme_hash {
         if !hash.is_empty() {
             if let Some(dark_sha1) = AppConfig::sha1_file(dark_scheme_path) {
@@ -476,7 +529,7 @@ pub fn read_kdeglobals_light_mode(
         }
     }
 
-    // 3. Fallback to [Colors:Window] BackgroundNormal relative luminance
+    // 5. Fallback to [Colors:Window] BackgroundNormal relative luminance
     if let Some(ref bg_normal) = background_normal {
         if let Some(hex) = normalize_color(bg_normal) {
             let lum = crate::color::color_luminance(&hex);
@@ -1157,6 +1210,38 @@ Category=
         std::fs::write(
             &kdeglobals,
             "[General]\nColorScheme=CustomTheme\n\n[Colors:Window]\nBackgroundNormal=#181a1f\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_kdeglobals_light_mode(&kdeglobals, &light_scheme, &dark_scheme),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_read_kdeglobals_light_mode_kde_lookandfeel_override_when_materialyou_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kdeglobals = dir.path().join("kdeglobals");
+        let light_scheme = dir.path().join("dummy_light.colors");
+        let dark_scheme = dir.path().join("dummy_dark.colors");
+        std::fs::write(&light_scheme, "").unwrap();
+        std::fs::write(&dark_scheme, "").unwrap();
+
+        // 1. ColorScheme=MaterialYouDark leftover, but KDE LookAndFeelPackage is Breeze light
+        std::fs::write(
+            &kdeglobals,
+            "[General]\nColorScheme=MaterialYouDark\n\n[KDE]\nLookAndFeelPackage=org.kde.breeze.desktop\nDefaultLightLookAndFeel=org.kde.breeze.desktop\nDefaultDarkLookAndFeel=org.kde.breezedark.desktop\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_kdeglobals_light_mode(&kdeglobals, &light_scheme, &dark_scheme),
+            Some(true)
+        );
+
+        // 2. ColorScheme=MaterialYouLight leftover, but KDE LookAndFeelPackage is Breeze dark
+        std::fs::write(
+            &kdeglobals,
+            "[General]\nColorScheme=MaterialYouLight\n\n[KDE]\nLookAndFeelPackage=org.kde.breezedark.desktop\nDefaultLightLookAndFeel=org.kde.breeze.desktop\nDefaultDarkLookAndFeel=org.kde.breezedark.desktop\n",
         )
         .unwrap();
         assert_eq!(
