@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub iconslight: Option<String>,
     pub iconsdark: Option<String>,
     pub pywal: bool,
+    pub kitty: bool,
     /// `None` when `pywal_follows_scheme` is `true` or not explicitly set.
     pub pywal_light: Option<bool>,
     pub light_blend_multiplier: f64,
@@ -73,6 +74,7 @@ impl Default for AppConfig {
             iconslight: None,
             iconsdark: None,
             pywal: false,
+            kitty: false,
             pywal_light: None,
             light_blend_multiplier: 1.0,
             dark_blend_multiplier: 1.0,
@@ -277,6 +279,9 @@ impl AppConfig {
         }
         if let Some(v) = get_non_empty("pywal").and_then(parse_bool) {
             config.pywal = v;
+        }
+        if let Some(v) = get_non_empty("kitty").and_then(parse_bool) {
+            config.kitty = v;
         }
 
         let raw_light = get_non_empty("light").and_then(parse_bool);
@@ -519,6 +524,9 @@ impl AppConfig {
         if cli.pywal {
             cfg.pywal = true;
         }
+        if cli.kitty {
+            cfg.kitty = true;
+        }
         if cli.pywal_dark {
             cfg.pywal_follows_scheme = false;
             cfg.pywal_light = Some(false);
@@ -666,6 +674,7 @@ impl AppConfig {
             self.iconsdark.as_deref().unwrap_or("")
         ));
         lines.push(format!("pywal={}", self.pywal));
+        lines.push(format!("kitty={}", self.kitty));
         lines.push(format!(
             "pywal_light={}",
             self.pywal_light.unwrap_or(false)
@@ -855,6 +864,7 @@ ncolor = -3
 light = YES
 plasma_follows_scheme = 0
 pywal = 1
+kitty = on
 pywal_light = True
 pywal_follows_scheme = false
 light_blend_multiplier = 9.5
@@ -883,6 +893,7 @@ kde_rounded_corners_effect_outline = true
         assert!(!cfg.plasma_follows_scheme);
         assert_eq!(cfg.light, Some(true));
         assert!(cfg.pywal);
+        assert!(cfg.kitty);
         assert!(!cfg.pywal_follows_scheme);
         assert_eq!(cfg.pywal_light, Some(true));
         assert_eq!(cfg.light_blend_multiplier, 4.0);
@@ -996,6 +1007,7 @@ iconslight = Breeze
         original.plasma_follows_scheme = false;
         original.light = Some(true);
         original.pywal = true;
+        original.kitty = true;
         original.pywal_follows_scheme = false;
         original.pywal_light = Some(false);
         original.titlebar_opacity_override = true;

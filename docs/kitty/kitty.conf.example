@@ -1,0 +1,10 @@
+# Configuración base de Kitty
+# ~/.config/kitty/kitty.conf
+
+cursor_trail 200
+cursor_trail_decay 0.1 0.4
+cursor_trail_start_threshold 2
+tab_bar_min_tabs 1
+
+# Enlace dinámico al tema activo (conmutado entre Material You y Noctalia)
+include current-theme.conf

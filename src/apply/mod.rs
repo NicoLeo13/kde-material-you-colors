@@ -3,6 +3,7 @@ pub mod ini_utils;
 pub mod konsole;
 pub mod ksyntax;
 pub mod pywal;
+pub mod kitty;
 pub mod titlebar;
 
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ pub use color_schemes::{
     ColorSchemeArtifacts,
 };
 pub use ini_utils::{hex_to_rgb_csv, KdeIni};
+pub use kitty::{generate_kitty_theme, write_kitty_themes, KittyArtifacts};
 pub use konsole::{
     ensure_konsole_profiles, format_konsole_opacity, generate_konsole_colorscheme,
     resolve_or_set_default_konsole_profile, write_konsole_schemes_and_profiles, KonsoleArtifacts,
@@ -128,6 +130,18 @@ impl ThemePaths {
         self.cache_dir.join("wal")
     }
 
+    pub fn kitty_dir(&self) -> PathBuf {
+        self.config_dir.join("kitty")
+    }
+
+    pub fn kitty_themes_dir(&self) -> PathBuf {
+        self.config_dir.join("kitty").join("themes")
+    }
+
+    pub fn kitty_current_theme_path(&self) -> PathBuf {
+        self.config_dir.join("kitty").join("current-theme.conf")
+    }
+
     pub fn runtime_json_path(&self) -> PathBuf {
         self.temp_dir
             .join(format!("kde-material-you-colors-{}.json", self.username))
@@ -149,6 +163,7 @@ pub struct AppliedArtifacts {
     pub ksyntax: KSyntaxArtifacts,
     pub konsole: KonsoleArtifacts,
     pub pywal: Option<PywalArtifacts>,
+    pub kitty: Option<KittyArtifacts>,
     pub applied_icon_theme: Option<String>,
     pub kwin_darker_rule_id: Option<String>,
     pub needs_kwin_reload: bool,
@@ -251,7 +266,18 @@ pub fn apply_all_themes(
         None
     };
 
-    // 8. User hook (on_change_hook)
+    // 8. Kitty themes (~/.config/kitty/themes/material-you-dark.conf, etc.)
+    let kitty = if config.kitty {
+        Some(write_kitty_themes(
+            scheme,
+            paths,
+            run_external_commands,
+        )?)
+    } else {
+        None
+    };
+
+    // 9. User hook (on_change_hook)
     let hook_configured =
         spawn_on_change_hook(config.on_change_hook.as_deref(), run_external_commands)?;
 
@@ -261,6 +287,7 @@ pub fn apply_all_themes(
         ksyntax,
         konsole,
         pywal,
+        kitty,
         applied_icon_theme,
         kwin_darker_rule_id,
         needs_kwin_reload,
@@ -483,6 +510,7 @@ mod tests {
         config.titlebar_opacity_dark = 75;
         config.darker_window_list = Some("konsole dolphin org.kde.kate".to_string());
         config.pywal = true;
+        config.kitty = true;
         config.on_change_hook = Some("echo theme_changed".to_string());
 
         let applied = apply_all_themes(&scheme, &config, &paths, false).unwrap();
@@ -569,5 +597,16 @@ mod tests {
         let plain_lines: Vec<&str> = plain_content.lines().collect();
         assert_eq!(plain_lines.len(), 16);
         assert!(plain_lines.iter().all(|l| l.starts_with('#') && l.len() == 7));
+
+        // Verify kitty theme files and symlink
+        let kitty_artifacts = applied.kitty.expect("kitty artifacts");
+        assert!(kitty_artifacts.dark_theme_path.exists());
+        assert!(kitty_artifacts.light_theme_path.exists());
+        #[cfg(unix)]
+        {
+            assert!(fs::symlink_metadata(&kitty_artifacts.current_theme_symlink).is_ok());
+            let target = fs::read_link(&kitty_artifacts.current_theme_symlink).unwrap();
+            assert_eq!(target, Path::new("themes/material-you-dark.conf"));
+        }
     }
 }

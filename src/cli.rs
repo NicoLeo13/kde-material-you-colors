@@ -87,6 +87,10 @@ pub struct CliArgs {
     #[arg(long = "pywal", visible_alias = "wal", action = ArgAction::SetTrue)]
     pub pywal: bool,
 
+    /// Export Kitty terminal theme files and manage current-theme.conf symlink
+    #[arg(long = "kitty", action = ArgAction::SetTrue)]
+    pub kitty: bool,
+
     /// Use Light mode for pywal controlled apps
     #[arg(
         long = "pywallight",
@@ -426,6 +430,7 @@ mod tests {
             "--ncolor",
             "1",
             "--pywal",
+            "--kitty",
             "--pywal-light",
             "--light-blend-multiplier",
             "1.5",
@@ -495,6 +500,7 @@ mod tests {
         );
         assert_eq!(args.ncolor, Some(1));
         assert!(args.pywal);
+        assert!(args.kitty);
         assert!(args.pywal_light);
         assert_eq!(args.light_blend_multiplier, Some(1.5));
         assert_eq!(args.dark_blend_multiplier, Some(2.0));

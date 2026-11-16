@@ -201,6 +201,7 @@ pub enum GuiMessage {
     KonsoleOpacityDarkChanged(u32),
     KonsoleBlurChanged(bool),
     ApplyPywalChanged(bool),
+    ApplyKittyChanged(bool),
     TitlebarOpacityOverrideChanged(bool),
     TitlebarOpacityChanged(u32),
     TitlebarOpacityDarkChanged(u32),
@@ -541,6 +542,9 @@ impl SettingsGui {
             }
             GuiMessage::ApplyPywalChanged(pywal) => {
                 self.config.pywal = pywal;
+            }
+            GuiMessage::ApplyKittyChanged(kitty) => {
+                self.config.kitty = kitty;
             }
             GuiMessage::TitlebarOpacityOverrideChanged(override_on) => {
                 self.config.titlebar_opacity_override = override_on;
@@ -1003,6 +1007,9 @@ impl SettingsGui {
                 Space::with_width(Length::Fixed(16.0)),
                 checkbox("Export Pywal palette files", self.config.pywal)
                     .on_toggle(GuiMessage::ApplyPywalChanged),
+                Space::with_width(Length::Fixed(16.0)),
+                checkbox("Export Kitty theme files", self.config.kitty)
+                    .on_toggle(GuiMessage::ApplyKittyChanged),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
@@ -1376,6 +1383,7 @@ mod tests {
         let _ = gui.update(GuiMessage::KonsoleOpacityDarkChanged(75));
         let _ = gui.update(GuiMessage::KonsoleBlurChanged(true));
         let _ = gui.update(GuiMessage::ApplyPywalChanged(true));
+        let _ = gui.update(GuiMessage::ApplyKittyChanged(true));
         let _ = gui.update(GuiMessage::TitlebarOpacityOverrideChanged(true));
         let _ = gui.update(GuiMessage::TitlebarOpacityChanged(90));
         let _ = gui.update(GuiMessage::TitlebarOpacityDarkChanged(80));
@@ -1410,6 +1418,7 @@ mod tests {
         assert_eq!(reloaded_cfg.konsole_opacity_dark, 75);
         assert!(reloaded_cfg.konsole_blur);
         assert!(reloaded_cfg.pywal);
+        assert!(reloaded_cfg.kitty);
         assert!(reloaded_cfg.titlebar_opacity_override);
         assert_eq!(reloaded_cfg.titlebar_opacity, 90);
         assert_eq!(reloaded_cfg.titlebar_opacity_dark, 80);
