@@ -4,16 +4,19 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use iced::theme::Palette;
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, pick_list, row, scrollable, slider, text,
-    text_input, Space,
+    button, checkbox, column, container, horizontal_rule, pick_list, responsive, row, scrollable,
+    slider, text, text_input, Row, Space,
 };
-use iced::{Alignment, Background, Border, Color, Element, Length, Task, Theme};
+use iced::{Alignment, Background, Border, Color, Element, Length, Size, Task, Theme};
 
+use crate::apply::ThemePaths;
 use crate::color::hex_to_rgb;
 use crate::config::{normalize_color, AppConfig};
 use crate::dbus_client;
 use crate::scheme::{MaterialYouScheme, SchemeRequest, SchemeVariant};
+use crate::wallpaper;
 
 /// Inner border radius for color role swatches inside preview cards (`better-ui` concentric radius rule).
 pub const SWATCH_INNER_RADIUS: f32 = 8.0;
@@ -171,9 +174,60 @@ pub fn hex_to_iced_color(hex: &str) -> Option<Color> {
     Some(Color::from_rgb8(r, g, b))
 }
 
+/// Navigation sections in the Studio Split-View settings window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSection {
+    ColorSource,
+    Appearance,
+    Targets,
+    Advanced,
+}
+
+impl SettingsSection {
+    pub const ALL: [Self; 4] = [
+        Self::ColorSource,
+        Self::Appearance,
+        Self::Targets,
+        Self::Advanced,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ColorSource => "Color Source & Seeds",
+            Self::Appearance => "Appearance & Multipliers",
+            Self::Targets => "Targets & Decorations",
+            Self::Advanced => "Advanced & Misc",
+        }
+    }
+}
+
+/// Theme mode for the Settings GUI window itself (independent of the Plasma target config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuiThemeMode {
+    System,
+    Dark,
+    Light,
+}
+
+impl GuiThemeMode {
+    pub const ALL: [Self; 3] = [Self::System, Self::Dark, Self::Light];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::System => "Follow System",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+}
+
 /// User interaction messages handled by `SettingsGui`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GuiMessage {
+    // Navigation & GUI Theme
+    SelectSection(SettingsSection),
+    GuiThemeModeChanged(GuiThemeMode),
+
     // Color Source
     UseWallpaperSource(bool),
     CustomColorChanged(String),
@@ -189,9 +243,17 @@ pub enum GuiMessage {
     // Scheme & Multipliers
     SchemeVariantChanged(SchemeVariant),
     ChromaMultiplierChanged(f64),
+    ChromaInputChanged(String),
+    ResetChromaMultiplier,
     ToneMultiplierChanged(f64),
+    ToneInputChanged(String),
+    ResetToneMultiplier,
     ContrastLevelChanged(f64),
+    ContrastInputChanged(String),
+    ResetContrastLevel,
     FrameContrastChanged(f64),
+    FrameContrastInputChanged(String),
+    ResetFrameContrast,
     SpecVersionChanged(String),
 
     // Targets & Advanced Settings
@@ -230,7 +292,15 @@ pub struct SettingsGui {
     pub config_path: PathBuf,
     pub runtime_json_path: PathBuf,
     pub current_scheme: Option<MaterialYouScheme>,
+    pub active_section: SettingsSection,
+    pub gui_theme_mode: GuiThemeMode,
+    pub system_light: bool,
+    pub chroma_input: String,
+    pub tone_input: String,
+    pub contrast_input: String,
+    pub frame_contrast_input: String,
     pub show_advanced: bool,
+    pub has_unsaved_changes: bool,
     pub status_message: String,
 }
 
@@ -253,12 +323,26 @@ impl SettingsGui {
         let config = AppConfig::load_from_path(&config_path).unwrap_or_default();
         let loaded_scheme = Self::load_runtime_scheme(&runtime_json_path);
 
+        let chroma_input = format!("{:.2}", config.chroma_multiplier);
+        let tone_input = format!("{:.2}", config.tone_multiplier);
+        let contrast_input = format!("{:.2}", config.contrast_level);
+        let frame_contrast_input = format!("{:.2}", config.frame_contrast);
+        let system_light = Self::detect_system_light_mode();
+
         let mut gui = Self {
             config,
             config_path,
             runtime_json_path,
             current_scheme: loaded_scheme,
+            active_section: SettingsSection::ColorSource,
+            gui_theme_mode: GuiThemeMode::System,
+            system_light,
+            chroma_input,
+            tone_input,
+            contrast_input,
+            frame_contrast_input,
             show_advanced: false,
+            has_unsaved_changes: false,
             status_message: "Ready".to_string(),
         };
 
@@ -266,6 +350,15 @@ impl SettingsGui {
             gui.regenerate_preview_scheme();
         }
         gui
+    }
+
+    /// Detect whether KDE Plasma is currently using a Light color scheme via `~/.config/kdeglobals`.
+    pub fn detect_system_light_mode() -> bool {
+        let paths = ThemePaths::default();
+        let light_scheme = paths.color_schemes_dir().join("MaterialYouLight.colors");
+        let dark_scheme = paths.color_schemes_dir().join("MaterialYouDark.colors");
+        wallpaper::read_kdeglobals_light_mode(&paths.kdeglobals_path(), &light_scheme, &dark_scheme)
+            .unwrap_or(false)
     }
 
     /// Parse an existing runtime JSON file (if present) or reconstruct a `MaterialYouScheme` from it.
@@ -350,7 +443,7 @@ impl SettingsGui {
             None
         };
 
-        let is_light = self.config.light.unwrap_or(false);
+        let is_light = self.config.light.unwrap_or(self.system_light);
         let is_pywal_light = self.config.pywal_light.unwrap_or(is_light);
         let chroma_mult = if self.config.chroma_multiplier <= 0.0 {
             0.001
@@ -437,7 +530,16 @@ impl SettingsGui {
 
     /// Handle GUI state transitions for all user controls.
     pub fn update(&mut self, message: GuiMessage) -> Task<GuiMessage> {
+        let mut mutated = true;
         match message {
+            GuiMessage::SelectSection(section) => {
+                self.active_section = section;
+                mutated = false;
+            }
+            GuiMessage::GuiThemeModeChanged(mode) => {
+                self.gui_theme_mode = mode;
+                mutated = false;
+            }
             GuiMessage::UseWallpaperSource(use_wallpaper) => {
                 if use_wallpaper {
                     self.config.color = None;
@@ -478,9 +580,11 @@ impl SettingsGui {
                 self.regenerate_preview_scheme();
             }
             GuiMessage::FetchColorsNow => {
+                mutated = false;
                 self.config.fetch_colors = true;
                 match self.save_and_touch_reload() {
                     Ok(_) => {
+                        self.has_unsaved_changes = false;
                         self.status_message = "Requested immediate wallpaper color fetch".to_string();
                     }
                     Err(err) => {
@@ -501,23 +605,79 @@ impl SettingsGui {
                 self.regenerate_preview_scheme();
             }
             GuiMessage::ChromaMultiplierChanged(val) => {
-                self.config.chroma_multiplier = (val * 100.0).round() / 100.0;
-                self.config.chroma_multiplier = self.config.chroma_multiplier.clamp(0.0, 4.0);
+                self.config.chroma_multiplier = ((val * 100.0).round() / 100.0).clamp(0.0, 4.0);
+                self.chroma_input = format!("{:.2}", self.config.chroma_multiplier);
+                self.regenerate_preview_scheme();
+            }
+            GuiMessage::ChromaInputChanged(raw) => {
+                self.chroma_input = raw.clone();
+                if let Ok(parsed) = raw.trim().parse::<f64>() {
+                    if parsed.is_finite() {
+                        self.config.chroma_multiplier = parsed.clamp(0.0, 4.0);
+                        self.regenerate_preview_scheme();
+                    }
+                }
+            }
+            GuiMessage::ResetChromaMultiplier => {
+                self.config.chroma_multiplier = 1.0;
+                self.chroma_input = "1.00".to_string();
                 self.regenerate_preview_scheme();
             }
             GuiMessage::ToneMultiplierChanged(val) => {
-                self.config.tone_multiplier = (val * 100.0).round() / 100.0;
-                self.config.tone_multiplier = self.config.tone_multiplier.clamp(0.0, 1.5);
+                self.config.tone_multiplier = ((val * 100.0).round() / 100.0).clamp(0.0, 1.5);
+                self.tone_input = format!("{:.2}", self.config.tone_multiplier);
+                self.regenerate_preview_scheme();
+            }
+            GuiMessage::ToneInputChanged(raw) => {
+                self.tone_input = raw.clone();
+                if let Ok(parsed) = raw.trim().parse::<f64>() {
+                    if parsed.is_finite() {
+                        self.config.tone_multiplier = parsed.clamp(0.0, 1.5);
+                        self.regenerate_preview_scheme();
+                    }
+                }
+            }
+            GuiMessage::ResetToneMultiplier => {
+                self.config.tone_multiplier = 1.0;
+                self.tone_input = "1.00".to_string();
                 self.regenerate_preview_scheme();
             }
             GuiMessage::ContrastLevelChanged(val) => {
-                self.config.contrast_level = (val * 100.0).round() / 100.0;
-                self.config.contrast_level = self.config.contrast_level.clamp(-1.0, 1.0);
+                self.config.contrast_level = ((val * 100.0).round() / 100.0).clamp(-1.0, 1.0);
+                self.contrast_input = format!("{:.2}", self.config.contrast_level);
+                self.regenerate_preview_scheme();
+            }
+            GuiMessage::ContrastInputChanged(raw) => {
+                self.contrast_input = raw.clone();
+                if let Ok(parsed) = raw.trim().parse::<f64>() {
+                    if parsed.is_finite() {
+                        self.config.contrast_level = parsed.clamp(-1.0, 1.0);
+                        self.regenerate_preview_scheme();
+                    }
+                }
+            }
+            GuiMessage::ResetContrastLevel => {
+                self.config.contrast_level = 0.0;
+                self.contrast_input = "0.00".to_string();
                 self.regenerate_preview_scheme();
             }
             GuiMessage::FrameContrastChanged(val) => {
-                self.config.frame_contrast = (val * 100.0).round() / 100.0;
-                self.config.frame_contrast = self.config.frame_contrast.clamp(0.0, 1.0);
+                self.config.frame_contrast = ((val * 100.0).round() / 100.0).clamp(0.0, 1.0);
+                self.frame_contrast_input = format!("{:.2}", self.config.frame_contrast);
+                self.regenerate_preview_scheme();
+            }
+            GuiMessage::FrameContrastInputChanged(raw) => {
+                self.frame_contrast_input = raw.clone();
+                if let Ok(parsed) = raw.trim().parse::<f64>() {
+                    if parsed.is_finite() {
+                        self.config.frame_contrast = parsed.clamp(0.0, 1.0);
+                        self.regenerate_preview_scheme();
+                    }
+                }
+            }
+            GuiMessage::ResetFrameContrast => {
+                self.config.frame_contrast = 0.0;
+                self.frame_contrast_input = "0.00".to_string();
                 self.regenerate_preview_scheme();
             }
             GuiMessage::SpecVersionChanged(spec) => {
@@ -526,7 +686,11 @@ impl SettingsGui {
                 }
             }
             GuiMessage::ToggleAdvanced(show) => {
+                mutated = false;
                 self.show_advanced = show;
+                if show {
+                    self.active_section = SettingsSection::Advanced;
+                }
             }
             GuiMessage::ApplyKonsoleChanged(apply_konsole) => {
                 self.config.disable_konsole = !apply_konsole;
@@ -614,32 +778,79 @@ impl SettingsGui {
             GuiMessage::ManualFetchChanged(manual) => {
                 self.config.manual_fetch = manual;
             }
-            GuiMessage::SaveAndApply => match self.save_and_touch_reload() {
-                Ok(_) => {
-                    self.status_message =
-                        format!("Saved configuration to {}", self.config_path.display());
+            GuiMessage::SaveAndApply => {
+                mutated = false;
+                match self.save_and_touch_reload() {
+                    Ok(_) => {
+                        self.has_unsaved_changes = false;
+                        self.status_message =
+                            format!("Saved configuration to {}", self.config_path.display());
+                    }
+                    Err(err) => {
+                        self.status_message = format!("Failed to save configuration: {err}");
+                    }
                 }
-                Err(err) => {
-                    self.status_message = format!("Failed to save configuration: {err}");
-                }
-            },
+            }
+        }
+        if mutated {
+            self.has_unsaved_changes = true;
         }
         Task::none()
     }
 
-    /// Return the active `iced::Theme` matching the selected dark/light state.
-    pub fn theme(&self) -> Theme {
-        if self.config.light == Some(true) {
-            Theme::Light
-        } else {
-            Theme::Dark
+    /// Return whether the effective preview/window theme is light mode.
+    pub fn is_light_theme(&self) -> bool {
+        match self.gui_theme_mode {
+            GuiThemeMode::System => self.system_light,
+            GuiThemeMode::Light => true,
+            GuiThemeMode::Dark => false,
         }
+    }
+
+    /// Lookup an `iced::Color` for a Material You role with a fallback color.
+    fn role_color(&self, role: &str, fallback: Color) -> Color {
+        self.active_role_hex(role)
+            .and_then(|hex| hex_to_iced_color(&hex))
+            .unwrap_or(fallback)
+    }
+
+    /// Return a dynamic `iced::Theme` driven by the active Material You palette.
+    pub fn theme(&self) -> Theme {
+        let is_light = self.is_light_theme();
+        let (fb_bg, fb_text, fb_primary, fb_success, fb_danger) = if is_light {
+            (
+                Color::from_rgb8(254, 247, 255),
+                Color::from_rgb8(29, 27, 32),
+                Color::from_rgb8(103, 80, 164),
+                Color::from_rgb8(125, 82, 96),
+                Color::from_rgb8(179, 38, 30),
+            )
+        } else {
+            (
+                Color::from_rgb8(20, 18, 24),
+                Color::from_rgb8(230, 224, 233),
+                Color::from_rgb8(208, 188, 255),
+                Color::from_rgb8(239, 184, 200),
+                Color::from_rgb8(242, 184, 181),
+            )
+        };
+
+        Theme::custom(
+            "Material You".to_string(),
+            Palette {
+                background: self.role_color("background", fb_bg),
+                text: self.role_color("onBackground", fb_text),
+                primary: self.role_color("primary", fb_primary),
+                success: self.role_color("tertiary", fb_success),
+                danger: self.role_color("error", fb_danger),
+            },
+        )
     }
 
     /// Lookup a role hex color from the currently active light/dark map of `self.current_scheme`.
     pub fn active_role_hex(&self, role: &str) -> Option<String> {
         let scheme = self.current_scheme.as_ref()?;
-        let is_light = self.config.light.unwrap_or(scheme.light);
+        let is_light = self.is_light_theme();
         let map = if is_light {
             &scheme.schemes.light
         } else {
@@ -648,76 +859,295 @@ impl SettingsGui {
         map.get(role).cloned()
     }
 
-    /// Build the responsive Material You Settings & Live Palette Preview interface.
+    /// Extract the resolved Material You UI palette for consistent widget styling.
+    fn ui_palette(&self) -> UiPalette {
+        let is_light = self.is_light_theme();
+        if is_light {
+            UiPalette {
+                background: self.role_color("background", Color::from_rgb8(254, 247, 255)),
+                surface: self.role_color("surfaceContainerLow", Color::from_rgb8(243, 237, 247)),
+                surface_high: self.role_color("surfaceContainerHigh", Color::from_rgb8(230, 224, 233)),
+                surface_highest: self.role_color("surfaceContainerHighest", Color::from_rgb8(219, 213, 224)),
+                on_surface: self.role_color("onSurface", Color::from_rgb8(29, 27, 32)),
+                on_surface_var: self.role_color("onSurfaceVariant", Color::from_rgb8(73, 69, 79)),
+                outline: self.role_color("outlineVariant", Color::from_rgb8(202, 196, 208)),
+                primary: self.role_color("primary", Color::from_rgb8(103, 80, 164)),
+                on_primary: self.role_color("onPrimary", Color::WHITE),
+                primary_container: self.role_color("primaryContainer", Color::from_rgb8(234, 221, 255)),
+                on_primary_container: self.role_color("onPrimaryContainer", Color::from_rgb8(33, 0, 93)),
+                tertiary: self.role_color("tertiary", Color::from_rgb8(125, 82, 96)),
+                on_tertiary: self.role_color("onTertiary", Color::WHITE),
+                error: self.role_color("error", Color::from_rgb8(179, 38, 30)),
+            }
+        } else {
+            UiPalette {
+                background: self.role_color("background", Color::from_rgb8(20, 18, 24)),
+                surface: self.role_color("surfaceContainerLow", Color::from_rgb8(29, 27, 32)),
+                surface_high: self.role_color("surfaceContainerHigh", Color::from_rgb8(43, 41, 48)),
+                surface_highest: self.role_color("surfaceContainerHighest", Color::from_rgb8(54, 52, 59)),
+                on_surface: self.role_color("onSurface", Color::from_rgb8(230, 224, 233)),
+                on_surface_var: self.role_color("onSurfaceVariant", Color::from_rgb8(202, 196, 208)),
+                outline: self.role_color("outlineVariant", Color::from_rgb8(73, 69, 79)),
+                primary: self.role_color("primary", Color::from_rgb8(208, 188, 255)),
+                on_primary: self.role_color("onPrimary", Color::from_rgb8(56, 30, 114)),
+                primary_container: self.role_color("primaryContainer", Color::from_rgb8(79, 55, 139)),
+                on_primary_container: self.role_color("onPrimaryContainer", Color::from_rgb8(234, 221, 255)),
+                tertiary: self.role_color("tertiary", Color::from_rgb8(239, 184, 200)),
+                on_tertiary: self.role_color("onTertiary", Color::from_rgb8(73, 37, 50)),
+                error: self.role_color("error", Color::from_rgb8(242, 184, 181)),
+            }
+        }
+    }
+
+    /// Build the responsive Material You Studio Split-View interface.
     pub fn view(&self) -> Element<'_, GuiMessage> {
-        let surface_low_hex = self
-            .active_role_hex("surfaceContainerLow")
-            .unwrap_or_else(|| "#1d1b20".to_string());
-        let outline_var_hex = self
-            .active_role_hex("outlineVariant")
-            .unwrap_or_else(|| "#49454f".to_string());
+        let pal = self.ui_palette();
 
-        let header = row![
-            column![
-                text("Material You Colors").size(24),
-                text("Dynamic palette extraction and KDE Plasma 6 theme synchronization").size(13),
-            ]
-            .spacing(4)
-            .width(Length::Fill),
-            button(text("Fetch colors now").size(14))
-                .padding([8, 14])
-                .on_press(GuiMessage::FetchColorsNow),
-            button(text("Save changes").size(14))
-                .padding([8, 16])
-                .on_press(GuiMessage::SaveAndApply),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
+        let active_seed_hex = self
+            .current_scheme
+            .as_ref()
+            .map(|s| s.seed.color.as_str())
+            .unwrap_or("#4285f4");
+        let active_variant = SchemeVariant::from_u8(self.config.scheme_variant);
+        let mode_label = if self.is_light_theme() {
+            "Light"
+        } else {
+            "Dark"
+        };
 
-        let preview_section = self.view_palette_preview(&surface_low_hex, &outline_var_hex);
-        let source_section = self.view_color_source_section(&surface_low_hex, &outline_var_hex);
-        let mode_and_scheme_section =
-            self.view_mode_and_scheme_section(&surface_low_hex, &outline_var_hex);
-        let targets_section = self.view_targets_section(&surface_low_hex, &outline_var_hex);
+        let fetch_btn = button(text("Fetch now").size(13))
+            .padding([8, 13])
+            .style(move |_theme: &Theme, _status| button::Style {
+                background: Some(Background::Color(pal.surface_high)),
+                text_color: pal.on_surface,
+                border: Border {
+                    color: pal.outline,
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                ..Default::default()
+            })
+            .on_press(GuiMessage::FetchColorsNow);
 
-        let status_bar = row![
-            text(&self.status_message).size(13).width(Length::Fill),
-            checkbox("Show advanced settings", self.show_advanced)
-                .on_toggle(GuiMessage::ToggleAdvanced),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
+        let save_label = if self.has_unsaved_changes {
+            "• Save & Apply"
+        } else {
+            "Save & Apply"
+        };
+        let save_btn = button(text(save_label).size(13))
+            .padding([8, 15])
+            .style(move |_theme: &Theme, _status| button::Style {
+                background: Some(Background::Color(pal.primary)),
+                text_color: pal.on_primary,
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 10.0.into(),
+                },
+                ..Default::default()
+            })
+            .on_press(GuiMessage::SaveAndApply);
 
-        let mut content_col = column![
-            header,
-            horizontal_rule(1),
-            preview_section,
-            source_section,
-            mode_and_scheme_section,
-            targets_section,
-        ]
-        .spacing(16)
-        .padding(20)
+        let header = container(
+            Row::with_children(vec![
+                column![
+                    text("Material You Colors").size(19),
+                    text(format!(
+                        "Active seed {active_seed_hex} · {active_variant} · {mode_label}"
+                    ))
+                    .size(12)
+                    .color(pal.on_surface_var),
+                ]
+                .spacing(2)
+                .width(Length::FillPortion(1))
+                .into(),
+                Row::with_children(vec![
+                    fetch_btn.into(),
+                    save_btn.into(),
+                ])
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .wrap()
+                .into(),
+            ])
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .wrap(),
+        )
+        .padding([12, 18])
         .width(Length::Fill);
 
-        if self.show_advanced {
-            content_col = content_col.push(
-                self.view_advanced_section(&surface_low_hex, &outline_var_hex),
+        let body = responsive(move |size| {
+            let is_wide = size.width >= 760.0;
+            let right_section = match self.active_section {
+                SettingsSection::ColorSource => self.view_color_source_section(pal),
+                SettingsSection::Appearance => self.view_mode_and_scheme_section(pal),
+                SettingsSection::Targets => self.view_targets_section(pal),
+                SettingsSection::Advanced => self.view_advanced_section(pal),
+            };
+
+            if is_wide {
+                let preview_sidebar = self.view_palette_preview(pal, true);
+
+                let mut nav_col = column![].spacing(4).width(Length::Fill);
+                for section in SettingsSection::ALL {
+                    let is_active = self.active_section == section;
+                    nav_col = nav_col.push(
+                        button(text(section.label()).size(13))
+                            .width(Length::Fill)
+                            .padding([8, 12])
+                            .style(move |_theme: &Theme, _status| button::Style {
+                                background: Some(Background::Color(if is_active {
+                                    pal.primary_container
+                                } else {
+                                    Color::TRANSPARENT
+                                })),
+                                text_color: if is_active {
+                                    pal.on_primary_container
+                                } else {
+                                    pal.on_surface_var
+                                },
+                                border: Border {
+                                    color: Color::TRANSPARENT,
+                                    width: 0.0,
+                                    radius: 10.0.into(),
+                                },
+                                ..Default::default()
+                            })
+                            .on_press(GuiMessage::SelectSection(section)),
+                    );
+                }
+
+                let sidebar_inner = column![preview_sidebar, horizontal_rule(1), nav_col]
+                    .spacing(12)
+                    .width(Length::Fill);
+
+                let sidebar = container(
+                    scrollable(sidebar_inner).height(Length::Fill),
+                )
+                .width(Length::Fixed(272.0))
+                .height(Length::Fill)
+                .padding(14)
+                .style(move |_theme| container::Style {
+                    background: Some(Background::Color(pal.surface)),
+                    border: Border {
+                        color: pal.outline,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    ..Default::default()
+                });
+
+                let right_canvas = scrollable(
+                    container(right_section)
+                        .padding(18)
+                        .width(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+                row![sidebar, right_canvas]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                // Narrow / tiling half-screen responsive layout: stacked top nav + palette + full-width section
+                let nav_pills: Vec<Element<'_, GuiMessage>> = SettingsSection::ALL
+                    .into_iter()
+                    .map(|section| {
+                        let is_active = self.active_section == section;
+                        button(text(section.label()).size(12))
+                            .padding([6, 10])
+                            .style(move |_theme: &Theme, _status| button::Style {
+                                background: Some(Background::Color(if is_active {
+                                    pal.primary_container
+                                } else {
+                                    pal.surface_high
+                                })),
+                                text_color: if is_active {
+                                    pal.on_primary_container
+                                } else {
+                                    pal.on_surface_var
+                                },
+                                border: Border {
+                                    color: if is_active {
+                                        pal.primary
+                                    } else {
+                                        pal.outline
+                                    },
+                                    width: 1.0,
+                                    radius: 8.0.into(),
+                                },
+                                ..Default::default()
+                            })
+                            .on_press(GuiMessage::SelectSection(section))
+                            .into()
+                    })
+                    .collect();
+
+                let nav_wrap = Row::with_children(nav_pills).spacing(6).wrap();
+                let compact_palette = self.view_palette_preview(pal, false);
+
+                scrollable(
+                    container(
+                        column![nav_wrap, compact_palette, right_section]
+                            .spacing(12)
+                            .width(Length::Fill),
+                    )
+                    .padding(14)
+                    .width(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+            }
+        });
+
+        let mut status_row = row![
+            text(&self.status_message)
+                .size(12)
+                .color(pal.on_surface_var)
+                .width(Length::Fill),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+
+        if self.has_unsaved_changes {
+            status_row = status_row.push(
+                container(text("Unsaved changes").size(11).color(pal.on_tertiary))
+                    .padding([3, 10])
+                    .style(move |_theme| container::Style {
+                        background: Some(Background::Color(pal.tertiary)),
+                        border: Border {
+                            color: Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: 999.0.into(),
+                        },
+                        ..Default::default()
+                    }),
             );
         }
 
-        content_col = content_col.push(horizontal_rule(1)).push(status_bar);
+        let status_bar = container(status_row)
+            .padding([8, 18])
+            .width(Length::Fill);
 
-        scrollable(container(content_col).width(Length::Fill)).into()
+        column![
+            header,
+            horizontal_rule(1),
+            container(body).width(Length::Fill).height(Length::Fill),
+            horizontal_rule(1),
+            status_bar,
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
-    fn view_palette_preview(
-        &self,
-        card_bg_hex: &str,
-        border_hex: &str,
-    ) -> Element<'_, GuiMessage> {
-        let mut cards_row_1 = row![].spacing(10).width(Length::Fill);
-        let mut cards_row_2 = row![].spacing(10).width(Length::Fill);
+    fn view_palette_preview(&self, pal: UiPalette, three_col: bool) -> Element<'_, GuiMessage> {
+        let cols = if three_col { 3 } else { 5 };
+        let mut grid_col = column![].spacing(6).width(Length::Fill);
+        let mut current_row = row![].spacing(6).width(Length::Fill);
 
         for (idx, (role_key, role_label, on_role_key)) in PREVIEW_ROLES.iter().enumerate() {
             let bg_hex = self
@@ -727,20 +1157,25 @@ impl SettingsGui {
                 .active_role_hex(on_role_key)
                 .unwrap_or_else(|| "#e6e0e9".to_string());
 
-            let swatch_bg = hex_to_iced_color(&bg_hex).unwrap_or(Color::from_rgb8(43, 41, 48));
-            let swatch_fg = hex_to_iced_color(&fg_hex).unwrap_or(Color::WHITE);
-            let outer_bg = hex_to_iced_color(card_bg_hex).unwrap_or(Color::from_rgb8(29, 27, 32));
-            let outer_border =
-                hex_to_iced_color(border_hex).unwrap_or(Color::from_rgba(1.0, 1.0, 1.0, 0.12));
+            let swatch_bg = hex_to_iced_color(&bg_hex).unwrap_or(pal.surface_high);
+            let swatch_fg = hex_to_iced_color(&fg_hex).unwrap_or(pal.on_surface);
+
+            let short_label = match *role_label {
+                "Background" => "Bg",
+                "Surface Low" => "Surf Low",
+                "Surface Container" => "Surf Cont",
+                "Surface High" => "Surf High",
+                other => other,
+            };
 
             let inner_swatch = container(
                 column![
-                    text(*role_label).size(13).color(swatch_fg),
-                    text(bg_hex).size(11).color(swatch_fg),
+                    text(short_label).size(10).color(swatch_fg),
+                    text(bg_hex).size(9).color(swatch_fg),
                 ]
-                .spacing(4),
+                .spacing(1),
             )
-            .padding(10)
+            .padding([5, 6])
             .width(Length::Fill)
             .style(move |_theme: &Theme| container::Style {
                 background: Some(Background::Color(swatch_bg)),
@@ -748,78 +1183,223 @@ impl SettingsGui {
                 border: Border {
                     color: Color::from_rgba(0.0, 0.0, 0.0, 0.08),
                     width: 1.0,
-                    radius: SWATCH_INNER_RADIUS.into(),
+                    radius: 6.0.into(),
                 },
                 ..Default::default()
             });
 
-            // Concentric border radius: outer radius (16px) = inner radius (8px) + card padding (8px)
             let outer_card = container(inner_swatch)
-                .padding(SWATCH_CARD_PADDING)
+                .padding(4)
                 .width(Length::FillPortion(1))
                 .style(move |_theme: &Theme| container::Style {
-                    background: Some(Background::Color(outer_bg)),
+                    background: Some(Background::Color(pal.surface_high)),
                     border: Border {
-                        color: outer_border,
+                        color: pal.outline,
                         width: 1.0,
-                        radius: SWATCH_OUTER_RADIUS.into(),
+                        radius: 10.0.into(),
                     },
                     ..Default::default()
                 });
 
-            if idx < 5 {
-                cards_row_1 = cards_row_1.push(outer_card);
-            } else {
-                cards_row_2 = cards_row_2.push(outer_card);
+            current_row = current_row.push(outer_card);
+            if idx % cols == cols - 1 || idx == PREVIEW_ROLES.len() - 1 {
+                grid_col = grid_col.push(current_row);
+                current_row = row![].spacing(6).width(Length::Fill);
             }
         }
 
         column![
-            text("Live Material You palette").size(16),
-            cards_row_1,
-            cards_row_2,
+            text("Live Material You Palette").size(13).color(pal.on_surface),
+            grid_col,
         ]
-        .spacing(10)
+        .spacing(6)
         .into()
     }
 
-    fn view_color_source_section(
-        &self,
-        card_bg_hex: &str,
-        border_hex: &str,
-    ) -> Element<'_, GuiMessage> {
+    fn view_color_source_section(&self, pal: UiPalette) -> Element<'_, GuiMessage> {
         let using_wallpaper = self.config.color.is_none();
         let custom_color_val = self.config.color.as_deref().unwrap_or("");
         let monitor_str = self.config.monitor.to_string();
 
-        let source_toggle_row = row![
-            checkbox("Extract colors from wallpaper", using_wallpaper)
-                .on_toggle(GuiMessage::UseWallpaperSource),
-            Space::with_width(Length::Fixed(16.0)),
-            text("Monitor index:").size(14),
-            button(text("-").size(14))
-                .padding([4, 10])
-                .on_press(GuiMessage::MonitorChanged(
-                    self.config.monitor.saturating_sub(1)
-                )),
-            text_input("0", &monitor_str)
-                .on_input(GuiMessage::MonitorInputChanged)
-                .width(Length::Fixed(56.0)),
-            button(text("+").size(14))
-                .padding([4, 10])
-                .on_press(GuiMessage::MonitorChanged(self.config.monitor + 1)),
-            Space::with_width(Length::Fixed(16.0)),
-            text("Custom seed hex:").size(14),
-            text_input("#4285f4", custom_color_val)
-                .on_input(GuiMessage::CustomColorChanged)
-                .width(Length::Fixed(120.0)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
+        let wallpaper_btn: Element<'_, GuiMessage> = button(text("Wallpaper").size(13))
+            .padding([7, 14])
+            .style(move |_theme: &Theme, _status| button::Style {
+                background: Some(Background::Color(if using_wallpaper {
+                    pal.primary
+                } else {
+                    pal.surface_high
+                })),
+                text_color: if using_wallpaper {
+                    pal.on_primary
+                } else {
+                    pal.on_surface_var
+                },
+                border: Border {
+                    color: if using_wallpaper {
+                        Color::TRANSPARENT
+                    } else {
+                        pal.outline
+                    },
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            })
+            .on_press(GuiMessage::UseWallpaperSource(true))
+            .into();
 
-        let mut seed_pills_row = row![text("Wallpaper seed swatches:").size(14)]
-            .spacing(8)
-            .align_y(Alignment::Center);
+        let custom_btn: Element<'_, GuiMessage> = button(text("Custom Hex").size(13))
+            .padding([7, 14])
+            .style(move |_theme: &Theme, _status| button::Style {
+                background: Some(Background::Color(if !using_wallpaper {
+                    pal.primary
+                } else {
+                    pal.surface_high
+                })),
+                text_color: if !using_wallpaper {
+                    pal.on_primary
+                } else {
+                    pal.on_surface_var
+                },
+                border: Border {
+                    color: if !using_wallpaper {
+                        Color::TRANSPARENT
+                    } else {
+                        pal.outline
+                    },
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            })
+            .on_press(GuiMessage::UseWallpaperSource(false))
+            .into();
+
+        let source_segmented: Element<'_, GuiMessage> =
+            container(row![wallpaper_btn, custom_btn].spacing(4))
+                .padding(3)
+                .style(move |_theme: &Theme| container::Style {
+                    background: Some(Background::Color(pal.surface_high)),
+                    border: Border {
+                        color: pal.outline,
+                        width: 1.0,
+                        radius: 10.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into();
+
+        let monitor_stepper: Element<'_, GuiMessage> = container(
+            row![
+                button(text("−").size(14))
+                    .padding([5, 11])
+                    .style(move |_theme: &Theme, _status| button::Style {
+                        background: Some(Background::Color(pal.surface_high)),
+                        text_color: pal.on_surface,
+                        border: Border {
+                            color: Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: 7.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .on_press(GuiMessage::MonitorChanged(
+                        self.config.monitor.saturating_sub(1)
+                    )),
+                text_input("0", &monitor_str)
+                    .on_input(GuiMessage::MonitorInputChanged)
+                    .width(Length::Fixed(48.0))
+                    .padding([5, 8])
+                    .style(move |_theme, status| pal.text_input_style(status, false)),
+                button(text("+").size(14))
+                    .padding([5, 11])
+                    .style(move |_theme: &Theme, _status| button::Style {
+                        background: Some(Background::Color(pal.surface_high)),
+                        text_color: pal.on_surface,
+                        border: Border {
+                            color: Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: 7.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .on_press(GuiMessage::MonitorChanged(self.config.monitor + 1)),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+        .padding(3)
+        .style(move |_theme: &Theme| container::Style {
+            background: Some(Background::Color(pal.surface_high)),
+            border: Border {
+                color: pal.outline,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        })
+        .into();
+
+        let top_controls = Row::with_children(vec![
+            column![
+                text("Source mode").size(12).color(pal.on_surface_var),
+                source_segmented,
+            ]
+            .spacing(5)
+            .into(),
+            column![
+                text("Monitor index").size(12).color(pal.on_surface_var),
+                monitor_stepper,
+            ]
+            .spacing(5)
+            .into(),
+        ])
+        .spacing(16)
+        .align_y(Alignment::End)
+        .wrap();
+
+        let mut custom_col = column![].spacing(6);
+        if !using_wallpaper {
+            let parsed_custom = normalize_color(custom_color_val)
+                .as_deref()
+                .and_then(hex_to_iced_color);
+            let preview_color = parsed_custom.unwrap_or(Color::TRANSPARENT);
+            let is_invalid = !custom_color_val.trim().is_empty() && parsed_custom.is_none();
+
+            let swatch_dot = container(Space::with_width(Length::Fixed(24.0)))
+                .height(Length::Fixed(24.0))
+                .style(move |_theme| container::Style {
+                    background: Some(Background::Color(preview_color)),
+                    border: Border {
+                        color: if is_invalid { pal.error } else { pal.outline },
+                        width: 1.5,
+                        radius: 7.0.into(),
+                    },
+                    ..Default::default()
+                });
+
+            custom_col = custom_col.push(
+                row![
+                    text("Custom seed hex:").size(13).color(pal.on_surface_var),
+                    swatch_dot,
+                    text_input("#4285f4", custom_color_val)
+                        .on_input(GuiMessage::CustomColorChanged)
+                        .width(Length::Fixed(140.0))
+                        .padding([6, 10])
+                        .style(move |_theme, status| pal.text_input_style(status, is_invalid)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+
+            if is_invalid {
+                custom_col = custom_col.push(
+                    text("Invalid hex color (use #RGB, #RRGGBB, or RRGGBB)")
+                        .size(12)
+                        .color(pal.error),
+                );
+            }
+        }
 
         let best_colors: Vec<String> = self
             .current_scheme
@@ -827,433 +1407,859 @@ impl SettingsGui {
             .map(|s| s.best_list.clone())
             .unwrap_or_else(|| vec!["#4285f4".to_string()]);
 
-        for (idx, hex_str) in best_colors.into_iter().take(7).enumerate() {
-            let is_selected = (self.config.ncolor as usize) == idx && self.config.color.is_none();
-            let label = if is_selected {
-                format!("#{} {} ✓", idx + 1, hex_str)
-            } else {
-                format!("#{} {}", idx + 1, hex_str)
-            };
-            seed_pills_row = seed_pills_row.push(
-                button(text(label).size(13))
-                    .padding([6, 12])
-                    .on_press(GuiMessage::SeedIndexSelected(idx as u32)),
-            );
-        }
+        let seed_pills: Vec<Element<'_, GuiMessage>> = best_colors
+            .into_iter()
+            .take(7)
+            .enumerate()
+            .map(|(idx, hex_str)| {
+                let is_selected = (self.config.ncolor as usize) == idx && self.config.color.is_none();
+                let swatch_color =
+                    hex_to_iced_color(&hex_str).unwrap_or(Color::from_rgb8(66, 133, 244));
+
+                let circle = container(Space::with_width(Length::Fixed(16.0)))
+                    .height(Length::Fixed(16.0))
+                    .style(move |_theme| container::Style {
+                        background: Some(Background::Color(swatch_color)),
+                        border: Border {
+                            color: Color::from_rgba(1.0, 1.0, 1.0, 0.35),
+                            width: 1.0,
+                            radius: 8.0.into(),
+                        },
+                        ..Default::default()
+                    });
+
+                let label = format!("#{} {}", idx + 1, hex_str);
+                let bg = if is_selected {
+                    pal.primary_container
+                } else {
+                    pal.surface_high
+                };
+                let fg = if is_selected {
+                    pal.on_primary_container
+                } else {
+                    pal.on_surface
+                };
+                let border_c = if is_selected {
+                    pal.primary
+                } else {
+                    pal.outline
+                };
+
+                button(
+                    row![circle, text(label).size(12)]
+                        .spacing(7)
+                        .align_y(Alignment::Center),
+                )
+                .padding([6, 11])
+                .style(move |_theme: &Theme, _status| button::Style {
+                    background: Some(Background::Color(bg)),
+                    text_color: fg,
+                    border: Border {
+                        color: border_c,
+                        width: if is_selected { 1.5 } else { 1.0 },
+                        radius: 999.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .on_press(GuiMessage::SeedIndexSelected(idx as u32))
+                .into()
+            })
+            .collect();
+
+        let seed_pills_wrap = Row::with_children(seed_pills).spacing(8).wrap();
 
         Self::styled_section_card(
             column![
-                text("Color source").size(16),
-                source_toggle_row,
-                seed_pills_row,
+                text("Color Source & Wallpaper Seeds").size(16),
+                top_controls,
+                custom_col,
+                text("Extracted wallpaper seeds")
+                    .size(12)
+                    .color(pal.on_surface_var),
+                seed_pills_wrap,
             ]
             .spacing(12)
             .into(),
-            card_bg_hex,
-            border_hex,
+            pal,
         )
     }
 
-    fn view_mode_and_scheme_section(
-        &self,
-        card_bg_hex: &str,
-        border_hex: &str,
-    ) -> Element<'_, GuiMessage> {
+    fn view_mode_and_scheme_section(&self, pal: UiPalette) -> Element<'_, GuiMessage> {
         let plasma_mode = ThemeMode::from_plasma_config(&self.config);
         let pywal_mode = ThemeMode::from_pywal_config(&self.config);
         let current_variant = SchemeVariant::from_u8(self.config.scheme_variant);
 
-        let modes_row = row![
-            text("Plasma mode:").size(14),
-            pick_list(
-                ThemeMode::ALL.as_slice(),
-                Some(plasma_mode),
-                GuiMessage::PlasmaModeChanged,
-            ),
-            Space::with_width(Length::Fixed(16.0)),
-            text("Konsole / Pywal / KSyntax mode:").size(14),
-            pick_list(
-                ThemeMode::ALL.as_slice(),
-                Some(pywal_mode),
-                GuiMessage::PywalModeChanged,
-            ),
-            Space::with_width(Length::Fixed(16.0)),
-            text("Palette style:").size(14),
-            pick_list(
-                ALL_SCHEME_VARIANTS.as_slice(),
-                Some(current_variant),
-                GuiMessage::SchemeVariantChanged,
-            ),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
+        let modes_wrap = Row::with_children(vec![
+            column![
+                text("Plasma mode").size(12).color(pal.on_surface_var),
+                pick_list(
+                    ThemeMode::ALL.as_slice(),
+                    Some(plasma_mode),
+                    GuiMessage::PlasmaModeChanged,
+                )
+                .padding([7, 10])
+                .style(move |_theme, status| pal.pick_list_style(status)),
+            ]
+            .spacing(5)
+            .into(),
+            column![
+                text("Konsole / Pywal / KSyntax")
+                    .size(12)
+                    .color(pal.on_surface_var),
+                pick_list(
+                    ThemeMode::ALL.as_slice(),
+                    Some(pywal_mode),
+                    GuiMessage::PywalModeChanged,
+                )
+                .padding([7, 10])
+                .style(move |_theme, status| pal.pick_list_style(status)),
+            ]
+            .spacing(5)
+            .into(),
+            column![
+                text("Palette style").size(12).color(pal.on_surface_var),
+                pick_list(
+                    ALL_SCHEME_VARIANTS.as_slice(),
+                    Some(current_variant),
+                    GuiMessage::SchemeVariantChanged,
+                )
+                .padding([7, 10])
+                .style(move |_theme, status| pal.pick_list_style(status)),
+            ]
+            .spacing(5)
+            .into(),
+        ])
+        .spacing(14)
+        .align_y(Alignment::Center)
+        .wrap();
 
-        let spec_row = row![
-            text("Material spec version:").size(14),
-            button(
-                text(if self.config.spec_version == "2025" {
-                    "2025 ( Material 3 Expressive ) ✓"
-                } else {
-                    "2025"
-                })
+        let is_2025 = self.config.spec_version == "2025";
+        let spec_row = Row::with_children(vec![
+            text("Material spec version:")
                 .size(13)
-            )
-            .padding([6, 12])
-            .on_press(GuiMessage::SpecVersionChanged("2025".to_string())),
-            button(
-                text(if self.config.spec_version == "2021" {
-                    "2021 ( Classic M3 ) ✓"
-                } else {
-                    "2021"
+                .color(pal.on_surface_var)
+                .into(),
+            button(text("2025 (M3 Expressive)").size(12))
+                .padding([6, 12])
+                .style(move |_theme: &Theme, _status| button::Style {
+                    background: Some(Background::Color(if is_2025 {
+                        pal.primary_container
+                    } else {
+                        pal.surface_high
+                    })),
+                    text_color: if is_2025 {
+                        pal.on_primary_container
+                    } else {
+                        pal.on_surface
+                    },
+                    border: Border {
+                        color: if is_2025 { pal.primary } else { pal.outline },
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..Default::default()
                 })
-                .size(13)
-            )
-            .padding([6, 12])
-            .on_press(GuiMessage::SpecVersionChanged("2021".to_string())),
-        ]
+                .on_press(GuiMessage::SpecVersionChanged("2025".to_string()))
+                .into(),
+            button(text("2021 (Classic M3)").size(12))
+                .padding([6, 12])
+                .style(move |_theme: &Theme, _status| button::Style {
+                    background: Some(Background::Color(if !is_2025 {
+                        pal.primary_container
+                    } else {
+                        pal.surface_high
+                    })),
+                    text_color: if !is_2025 {
+                        pal.on_primary_container
+                    } else {
+                        pal.on_surface
+                    },
+                    border: Border {
+                        color: if !is_2025 { pal.primary } else { pal.outline },
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .on_press(GuiMessage::SpecVersionChanged("2021".to_string()))
+                .into(),
+        ])
         .spacing(10)
-        .align_y(Alignment::Center);
+        .align_y(Alignment::Center)
+        .wrap();
 
         let sliders_col = column![
-            row![
-                text(format!(
-                    "Chroma multiplier: {:.2}",
-                    self.config.chroma_multiplier
-                ))
-                .width(Length::Fixed(210.0))
-                .size(14),
-                slider(
-                    0.0..=4.0,
-                    self.config.chroma_multiplier,
-                    GuiMessage::ChromaMultiplierChanged,
-                )
-                .step(0.05),
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center),
-            row![
-                text(format!(
-                    "Tone / lightness multiplier: {:.2}",
-                    self.config.tone_multiplier
-                ))
-                .width(Length::Fixed(210.0))
-                .size(14),
-                slider(
-                    0.0..=1.5,
-                    self.config.tone_multiplier,
-                    GuiMessage::ToneMultiplierChanged,
-                )
-                .step(0.05),
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center),
-            row![
-                text(format!("Contrast level: {:.2}", self.config.contrast_level))
-                    .width(Length::Fixed(210.0))
-                    .size(14),
-                slider(
-                    -1.0..=1.0,
-                    self.config.contrast_level,
-                    GuiMessage::ContrastLevelChanged,
-                )
-                .step(0.05),
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center),
-            row![
-                text(format!("Frame contrast: {:.2}", self.config.frame_contrast))
-                    .width(Length::Fixed(210.0))
-                    .size(14),
-                slider(
-                    0.0..=1.0,
-                    self.config.frame_contrast,
-                    GuiMessage::FrameContrastChanged,
-                )
-                .step(0.05),
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center),
+            Self::multiplier_slider_row(
+                pal,
+                "Chroma multiplier",
+                self.config.chroma_multiplier,
+                &self.chroma_input,
+                1.0,
+                0.0..=4.0,
+                GuiMessage::ChromaMultiplierChanged,
+                GuiMessage::ChromaInputChanged,
+                GuiMessage::ResetChromaMultiplier,
+            ),
+            Self::multiplier_slider_row(
+                pal,
+                "Tone / lightness",
+                self.config.tone_multiplier,
+                &self.tone_input,
+                1.0,
+                0.0..=1.5,
+                GuiMessage::ToneMultiplierChanged,
+                GuiMessage::ToneInputChanged,
+                GuiMessage::ResetToneMultiplier,
+            ),
+            Self::multiplier_slider_row(
+                pal,
+                "Contrast level",
+                self.config.contrast_level,
+                &self.contrast_input,
+                0.0,
+                -1.0..=1.0,
+                GuiMessage::ContrastLevelChanged,
+                GuiMessage::ContrastInputChanged,
+                GuiMessage::ResetContrastLevel,
+            ),
+            Self::multiplier_slider_row(
+                pal,
+                "Frame contrast",
+                self.config.frame_contrast,
+                &self.frame_contrast_input,
+                0.0,
+                0.0..=1.0,
+                GuiMessage::FrameContrastChanged,
+                GuiMessage::FrameContrastInputChanged,
+                GuiMessage::ResetFrameContrast,
+            ),
         ]
         .spacing(10);
 
         Self::styled_section_card(
             column![
-                text("Appearance & scheme multipliers").size(16),
-                modes_row,
+                text("Appearance & Scheme Multipliers").size(16),
+                modes_wrap,
                 spec_row,
+                horizontal_rule(1),
                 sliders_col,
             ]
-            .spacing(12)
+            .spacing(14)
             .into(),
-            card_bg_hex,
-            border_hex,
+            pal,
         )
     }
 
-    fn view_targets_section(
-        &self,
-        card_bg_hex: &str,
-        border_hex: &str,
-    ) -> Element<'_, GuiMessage> {
+    #[allow(clippy::too_many_arguments)]
+    fn multiplier_slider_row<'a>(
+        pal: UiPalette,
+        label: &'a str,
+        value: f64,
+        input_str: &str,
+        default_val: f64,
+        range: std::ops::RangeInclusive<f64>,
+        on_change: fn(f64) -> GuiMessage,
+        on_input: fn(String) -> GuiMessage,
+        on_reset: GuiMessage,
+    ) -> Element<'a, GuiMessage> {
+        let is_invalid = input_str.trim().parse::<f64>().is_err();
+
+        let reset_slot: Element<'a, GuiMessage> = if (value - default_val).abs() > 0.01 {
+            button(text("Reset").size(11))
+                .width(Length::Fixed(52.0))
+                .padding([5, 8])
+                .style(move |_theme: &Theme, _status| button::Style {
+                    background: Some(Background::Color(pal.surface_high)),
+                    text_color: pal.on_surface_var,
+                    border: Border {
+                        color: pal.outline,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .on_press(on_reset)
+                .into()
+        } else {
+            Space::with_width(Length::Fixed(52.0)).into()
+        };
+
+        let controls = row![
+            slider(range, value, on_change)
+                .step(0.05)
+                .width(Length::Fill)
+                .style(move |_theme, status| pal.slider_style(status)),
+            text_input("0.00", input_str)
+                .on_input(on_input)
+                .width(Length::Fixed(64.0))
+                .padding([5, 8])
+                .style(move |_theme, status| pal.text_input_style(status, is_invalid)),
+            reset_slot,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        Row::with_children(vec![
+            text(label)
+                .size(13)
+                .color(pal.on_surface_var)
+                .width(Length::Fixed(140.0))
+                .into(),
+            controls.width(Length::FillPortion(1)).into(),
+        ])
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .wrap()
+        .into()
+    }
+
+    fn view_targets_section(&self, pal: UiPalette) -> Element<'_, GuiMessage> {
         let apply_konsole = !self.config.disable_konsole;
 
-        let konsole_col = column![
-            row![
-                checkbox("Apply theme to Konsole", apply_konsole)
-                    .on_toggle(GuiMessage::ApplyKonsoleChanged),
-                Space::with_width(Length::Fixed(16.0)),
-                checkbox("Enable Konsole background blur", self.config.konsole_blur)
-                    .on_toggle(GuiMessage::KonsoleBlurChanged),
-                Space::with_width(Length::Fixed(16.0)),
-                checkbox("Export Pywal palette files", self.config.pywal)
-                    .on_toggle(GuiMessage::ApplyPywalChanged),
-                Space::with_width(Length::Fixed(16.0)),
-                checkbox("Export Kitty theme files", self.config.kitty)
-                    .on_toggle(GuiMessage::ApplyKittyChanged),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            row![
-                text(format!(
-                    "Konsole opacity (light): {}%",
-                    self.config.konsole_opacity
-                ))
-                .width(Length::Fixed(210.0))
-                .size(14),
-                slider(
-                    0..=100,
-                    self.config.konsole_opacity,
-                    GuiMessage::KonsoleOpacityChanged,
-                ),
-                Space::with_width(Length::Fixed(16.0)),
-                text(format!(
-                    "Konsole opacity (dark): {}%",
-                    self.config.konsole_opacity_dark
-                ))
-                .width(Length::Fixed(210.0))
-                .size(14),
-                slider(
-                    0..=100,
-                    self.config.konsole_opacity_dark,
-                    GuiMessage::KonsoleOpacityDarkChanged,
-                ),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
+        let mut konsole_col = column![
+            checkbox("Apply theme to Konsole", apply_konsole)
+                .style(move |_theme, status| pal.checkbox_style(status))
+                .on_toggle(GuiMessage::ApplyKonsoleChanged),
         ]
-        .spacing(10);
+        .spacing(8);
 
-        let titlebar_col = column![
+        if apply_konsole {
+            konsole_col = konsole_col.push(
+                container(
+                    column![
+                        checkbox("Enable Konsole background blur", self.config.konsole_blur)
+                            .style(move |_theme, status| pal.checkbox_style(status))
+                            .on_toggle(GuiMessage::KonsoleBlurChanged),
+                        Row::with_children(vec![
+                            row![
+                                text(format!("Light opacity: {}%", self.config.konsole_opacity))
+                                    .width(Length::Fixed(130.0))
+                                    .size(13)
+                                    .color(pal.on_surface_var),
+                                slider(
+                                    0..=100,
+                                    self.config.konsole_opacity,
+                                    GuiMessage::KonsoleOpacityChanged,
+                                )
+                                .width(Length::Fixed(130.0))
+                                .style(move |_theme, status| pal.slider_style(status)),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center)
+                            .into(),
+                            row![
+                                text(format!(
+                                    "Dark opacity: {}%",
+                                    self.config.konsole_opacity_dark
+                                ))
+                                .width(Length::Fixed(130.0))
+                                .size(13)
+                                .color(pal.on_surface_var),
+                                slider(
+                                    0..=100,
+                                    self.config.konsole_opacity_dark,
+                                    GuiMessage::KonsoleOpacityDarkChanged,
+                                )
+                                .width(Length::Fixed(130.0))
+                                .style(move |_theme, status| pal.slider_style(status)),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center)
+                            .into(),
+                        ])
+                        .spacing(14)
+                        .wrap(),
+                    ]
+                    .spacing(8),
+                )
+                .padding(iced::Padding {
+                    top: 4.0,
+                    right: 0.0,
+                    bottom: 4.0,
+                    left: 24.0,
+                }),
+            );
+        }
+
+        let mut titlebar_col = column![
             checkbox(
                 "Override window titlebar opacity",
                 self.config.titlebar_opacity_override
             )
+            .style(move |_theme, status| pal.checkbox_style(status))
             .on_toggle(GuiMessage::TitlebarOpacityOverrideChanged),
-            row![
-                text(format!(
-                    "Titlebar opacity (light): {}%",
-                    self.config.titlebar_opacity
-                ))
-                .width(Length::Fixed(210.0))
-                .size(14),
-                slider(
-                    0..=100,
-                    self.config.titlebar_opacity,
-                    GuiMessage::TitlebarOpacityChanged,
-                ),
-                Space::with_width(Length::Fixed(16.0)),
-                text(format!(
-                    "Titlebar opacity (dark): {}%",
-                    self.config.titlebar_opacity_dark
-                ))
-                .width(Length::Fixed(210.0))
-                .size(14),
-                slider(
-                    0..=100,
-                    self.config.titlebar_opacity_dark,
-                    GuiMessage::TitlebarOpacityDarkChanged,
-                ),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
         ]
         .spacing(8);
 
-        let toolbar_col = column![
+        if self.config.titlebar_opacity_override {
+            titlebar_col = titlebar_col.push(
+                container(
+                    Row::with_children(vec![
+                        row![
+                            text(format!("Light: {}%", self.config.titlebar_opacity))
+                                .width(Length::Fixed(95.0))
+                                .size(13)
+                                .color(pal.on_surface_var),
+                            slider(
+                                0..=100,
+                                self.config.titlebar_opacity,
+                                GuiMessage::TitlebarOpacityChanged,
+                            )
+                            .width(Length::Fixed(130.0))
+                            .style(move |_theme, status| pal.slider_style(status)),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into(),
+                        row![
+                            text(format!("Dark: {}%", self.config.titlebar_opacity_dark))
+                                .width(Length::Fixed(95.0))
+                                .size(13)
+                                .color(pal.on_surface_var),
+                            slider(
+                                0..=100,
+                                self.config.titlebar_opacity_dark,
+                                GuiMessage::TitlebarOpacityDarkChanged,
+                            )
+                            .width(Length::Fixed(130.0))
+                            .style(move |_theme, status| pal.slider_style(status)),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into(),
+                    ])
+                    .spacing(14)
+                    .wrap(),
+                )
+                .padding(iced::Padding {
+                    top: 4.0,
+                    right: 0.0,
+                    bottom: 4.0,
+                    left: 24.0,
+                }),
+            );
+        }
+
+        let mut toolbar_col = column![
             checkbox(
                 "Override application toolbar opacity (Breeze)",
                 self.config.toolbar_opacity_override
             )
+            .style(move |_theme, status| pal.checkbox_style(status))
             .on_toggle(GuiMessage::ToolbarOpacityOverrideChanged),
-            row![
-                text(format!(
-                    "Toolbar opacity (light): {}%",
-                    self.config.toolbar_opacity
-                ))
-                .width(Length::Fixed(210.0))
-                .size(14),
-                slider(
-                    0..=100,
-                    self.config.toolbar_opacity,
-                    GuiMessage::ToolbarOpacityChanged,
-                ),
-                Space::with_width(Length::Fixed(16.0)),
-                text(format!(
-                    "Toolbar opacity (dark): {}%",
-                    self.config.toolbar_opacity_dark
-                ))
-                .width(Length::Fixed(210.0))
-                .size(14),
-                slider(
-                    0..=100,
-                    self.config.toolbar_opacity_dark,
-                    GuiMessage::ToolbarOpacityDarkChanged,
-                ),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
         ]
         .spacing(8);
 
-        let windeco_row = row![
+        if self.config.toolbar_opacity_override {
+            toolbar_col = toolbar_col.push(
+                container(
+                    Row::with_children(vec![
+                        row![
+                            text(format!("Light: {}%", self.config.toolbar_opacity))
+                                .width(Length::Fixed(95.0))
+                                .size(13)
+                                .color(pal.on_surface_var),
+                            slider(
+                                0..=100,
+                                self.config.toolbar_opacity,
+                                GuiMessage::ToolbarOpacityChanged,
+                            )
+                            .width(Length::Fixed(130.0))
+                            .style(move |_theme, status| pal.slider_style(status)),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into(),
+                        row![
+                            text(format!("Dark: {}%", self.config.toolbar_opacity_dark))
+                                .width(Length::Fixed(95.0))
+                                .size(13)
+                                .color(pal.on_surface_var),
+                            slider(
+                                0..=100,
+                                self.config.toolbar_opacity_dark,
+                                GuiMessage::ToolbarOpacityDarkChanged,
+                            )
+                            .width(Length::Fixed(130.0))
+                            .style(move |_theme, status| pal.slider_style(status)),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into(),
+                    ])
+                    .spacing(14)
+                    .wrap(),
+                )
+                .padding(iced::Padding {
+                    top: 4.0,
+                    right: 0.0,
+                    bottom: 4.0,
+                    left: 24.0,
+                }),
+            );
+        }
+
+        let integrations_wrap = Row::with_children(vec![
+            checkbox("Export Pywal palette files", self.config.pywal)
+                .style(move |_theme, status| pal.checkbox_style(status))
+                .on_toggle(GuiMessage::ApplyPywalChanged)
+                .into(),
+            checkbox("Export Kitty theme files", self.config.kitty)
+                .style(move |_theme, status| pal.checkbox_style(status))
+                .on_toggle(GuiMessage::ApplyKittyChanged)
+                .into(),
             checkbox(
                 "Tint Sierra Breeze window buttons",
-                self.config.sierra_breeze_buttons_color
+                self.config.sierra_breeze_buttons_color,
             )
-            .on_toggle(GuiMessage::SierraBreezeButtonsChanged),
-            Space::with_width(Length::Fixed(16.0)),
+            .style(move |_theme, status| pal.checkbox_style(status))
+            .on_toggle(GuiMessage::SierraBreezeButtonsChanged)
+            .into(),
             checkbox(
                 "Tint Klassy window decoration outline",
-                self.config.klassy_windeco_outline
+                self.config.klassy_windeco_outline,
             )
-            .on_toggle(GuiMessage::KlassyWindecoOutlineChanged),
-            Space::with_width(Length::Fixed(16.0)),
+            .style(move |_theme, status| pal.checkbox_style(status))
+            .on_toggle(GuiMessage::KlassyWindecoOutlineChanged)
+            .into(),
             checkbox(
                 "Tint KDE Rounded Corners outline",
-                self.config.kde_rounded_corners_effect_outline
+                self.config.kde_rounded_corners_effect_outline,
             )
-            .on_toggle(GuiMessage::KdeRoundedCornersOutlineChanged),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
+            .style(move |_theme, status| pal.checkbox_style(status))
+            .on_toggle(GuiMessage::KdeRoundedCornersOutlineChanged)
+            .into(),
+        ])
+        .spacing(14)
+        .align_y(Alignment::Center)
+        .wrap();
 
         Self::styled_section_card(
             column![
-                text("Theme targets & window decorations").size(16),
+                text("Theme Targets & Window Decorations").size(16),
                 konsole_col,
+                horizontal_rule(1),
                 titlebar_col,
                 toolbar_col,
-                windeco_row,
+                horizontal_rule(1),
+                text("Additional exports & decorations")
+                    .size(13)
+                    .color(pal.on_surface_var),
+                integrations_wrap,
             ]
             .spacing(12)
             .into(),
-            card_bg_hex,
-            border_hex,
+            pal,
         )
     }
 
-    fn view_advanced_section(
-        &self,
-        card_bg_hex: &str,
-        border_hex: &str,
-    ) -> Element<'_, GuiMessage> {
+    fn view_advanced_section(&self, pal: UiPalette) -> Element<'_, GuiMessage> {
         let darker_list = self.config.darker_window_list.as_deref().unwrap_or("");
         let icons_light = self.config.iconslight.as_deref().unwrap_or("");
         let icons_dark = self.config.iconsdark.as_deref().unwrap_or("");
         let hook = self.config.on_change_hook.as_deref().unwrap_or("");
 
         let inputs_col = column![
-            row![
-                text("Darker titlebar window classes:")
-                    .width(Length::Fixed(230.0))
-                    .size(14),
+            column![
+                text("Darker titlebar window classes")
+                    .size(12)
+                    .color(pal.on_surface_var),
                 text_input("konsole Alacritty kitty", darker_list)
                     .on_input(GuiMessage::DarkerWindowListChanged)
+                    .padding([7, 10])
+                    .style(move |_theme, status| pal.text_input_style(status, false))
                     .width(Length::Fill),
             ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            row![
-                text("Light mode icon theme:")
-                    .width(Length::Fixed(230.0))
-                    .size(14),
-                text_input("breeze", icons_light)
-                    .on_input(GuiMessage::IconsLightChanged)
-                    .width(Length::Fill),
-                Space::with_width(Length::Fixed(16.0)),
-                text("Dark mode icon theme:")
-                    .width(Length::Fixed(190.0))
-                    .size(14),
-                text_input("breeze-dark", icons_dark)
-                    .on_input(GuiMessage::IconsDarkChanged)
-                    .width(Length::Fill),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            row![
-                text("On-change hook command / script:")
-                    .width(Length::Fixed(230.0))
-                    .size(14),
+            .spacing(4),
+            Row::with_children(vec![
+                column![
+                    text("Light mode icon theme")
+                        .size(12)
+                        .color(pal.on_surface_var),
+                    text_input("breeze", icons_light)
+                        .on_input(GuiMessage::IconsLightChanged)
+                        .padding([7, 10])
+                        .style(move |_theme, status| pal.text_input_style(status, false))
+                        .width(Length::Fixed(210.0)),
+                ]
+                .spacing(4)
+                .into(),
+                column![
+                    text("Dark mode icon theme")
+                        .size(12)
+                        .color(pal.on_surface_var),
+                    text_input("breeze-dark", icons_dark)
+                        .on_input(GuiMessage::IconsDarkChanged)
+                        .padding([7, 10])
+                        .style(move |_theme, status| pal.text_input_style(status, false))
+                        .width(Length::Fixed(210.0)),
+                ]
+                .spacing(4)
+                .into(),
+            ])
+            .spacing(14)
+            .wrap(),
+            column![
+                text("On-change hook command / script")
+                    .size(12)
+                    .color(pal.on_surface_var),
                 text_input("/path/to/hook.sh", hook)
                     .on_input(GuiMessage::OnChangeHookChanged)
+                    .padding([7, 10])
+                    .style(move |_theme, status| pal.text_input_style(status, false))
                     .width(Length::Fill),
             ]
-            .spacing(10)
-            .align_y(Alignment::Center),
+            .spacing(4),
         ]
-        .spacing(10);
+        .spacing(12);
 
-        let flags_row = row![
+        let flags_wrap = Row::with_children(vec![
             checkbox("Pause automatic theme updates", self.config.pause_mode)
-                .on_toggle(GuiMessage::PauseModeChanged),
-            Space::with_width(Length::Fixed(16.0)),
+                .style(move |_theme, status| pal.checkbox_style(status))
+                .on_toggle(GuiMessage::PauseModeChanged)
+                .into(),
             checkbox(
                 "Force KWin screenshot capture mode",
-                self.config.screenshot_only_mode
+                self.config.screenshot_only_mode,
             )
-            .on_toggle(GuiMessage::ScreenshotOnlyModeChanged),
-            Space::with_width(Length::Fixed(16.0)),
-            checkbox("Manual wallpaper fetch only", self.config.manual_fetch)
-                .on_toggle(GuiMessage::ManualFetchChanged),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
-
-        Self::styled_section_card(
-            column![
-                text("Advanced automation & hooks").size(16),
-                inputs_col,
-                flags_row,
-            ]
-            .spacing(12)
+            .style(move |_theme, status| pal.checkbox_style(status))
+            .on_toggle(GuiMessage::ScreenshotOnlyModeChanged)
             .into(),
-            card_bg_hex,
-            border_hex,
-        )
+            checkbox("Manual wallpaper fetch only", self.config.manual_fetch)
+                .style(move |_theme, status| pal.checkbox_style(status))
+                .on_toggle(GuiMessage::ManualFetchChanged)
+                .into(),
+        ])
+        .spacing(14)
+        .align_y(Alignment::Center)
+        .wrap();
+
+        let advanced_card = Self::styled_section_card(
+            column![
+                text("Advanced Automation & Hooks").size(16),
+                inputs_col,
+                horizontal_rule(1),
+                flags_wrap,
+            ]
+            .spacing(14)
+            .into(),
+            pal,
+        );
+
+        let mut theme_mode_pills = row![].spacing(4).align_y(Alignment::Center);
+        for mode in GuiThemeMode::ALL {
+            let selected = self.gui_theme_mode == mode;
+            theme_mode_pills = theme_mode_pills.push(
+                button(text(mode.label()).size(12))
+                    .padding([6, 12])
+                    .style(move |_theme: &Theme, _status| button::Style {
+                        background: Some(Background::Color(if selected {
+                            pal.primary
+                        } else {
+                            Color::TRANSPARENT
+                        })),
+                        text_color: if selected {
+                            pal.on_primary
+                        } else {
+                            pal.on_surface_var
+                        },
+                        border: Border {
+                            color: Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: 7.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .on_press(GuiMessage::GuiThemeModeChanged(mode)),
+            );
+        }
+
+        let gui_theme_segmented: Element<'_, GuiMessage> = container(theme_mode_pills)
+            .padding(3)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(Background::Color(pal.surface_high)),
+                border: Border {
+                    color: pal.outline,
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                ..Default::default()
+            })
+            .into();
+
+        let misc_card = Self::styled_section_card(
+            column![
+                text("Misc · Settings Window").size(16),
+                text(
+                    "Controls only the appearance of this Settings window. \
+                     To change your KDE Plasma or terminal theme mode, use Appearance & Multipliers."
+                )
+                .size(12)
+                .color(pal.on_surface_var),
+                Row::with_children(vec![
+                    text("Settings window theme")
+                        .size(13)
+                        .color(pal.on_surface)
+                        .into(),
+                    gui_theme_segmented,
+                ])
+                .spacing(12)
+                .align_y(Alignment::Center)
+                .wrap(),
+            ]
+            .spacing(10)
+            .into(),
+            pal,
+        );
+
+        column![advanced_card, misc_card]
+            .spacing(14)
+            .width(Length::Fill)
+            .into()
     }
 
     fn styled_section_card<'a>(
         inner: Element<'a, GuiMessage>,
-        card_bg_hex: &str,
-        border_hex: &str,
+        pal: UiPalette,
     ) -> Element<'a, GuiMessage> {
-        let bg = hex_to_iced_color(card_bg_hex).unwrap_or(Color::from_rgb8(29, 27, 32));
-        let border_color =
-            hex_to_iced_color(border_hex).unwrap_or(Color::from_rgba(1.0, 1.0, 1.0, 0.12));
-
         container(inner)
             .padding(SECTION_CARD_PADDING)
             .width(Length::Fill)
             .style(move |_theme: &Theme| container::Style {
-                background: Some(Background::Color(bg)),
+                background: Some(Background::Color(pal.surface)),
                 border: Border {
-                    color: border_color,
+                    color: pal.outline,
                     width: 1.0,
                     radius: SECTION_OUTER_RADIUS.into(),
                 },
                 ..Default::default()
             })
             .into()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UiPalette {
+    background: Color,
+    surface: Color,
+    surface_high: Color,
+    surface_highest: Color,
+    on_surface: Color,
+    on_surface_var: Color,
+    outline: Color,
+    primary: Color,
+    on_primary: Color,
+    primary_container: Color,
+    on_primary_container: Color,
+    tertiary: Color,
+    on_tertiary: Color,
+    error: Color,
+}
+
+impl UiPalette {
+    fn text_input_style(&self, status: text_input::Status, is_invalid: bool) -> text_input::Style {
+        let border_color = if is_invalid {
+            self.error
+        } else {
+            match status {
+                text_input::Status::Focused => self.primary,
+                text_input::Status::Hovered => self.on_surface_var,
+                _ => self.outline,
+            }
+        };
+
+        text_input::Style {
+            background: Background::Color(self.surface_high),
+            border: Border {
+                color: border_color,
+                width: if matches!(status, text_input::Status::Focused) || is_invalid {
+                    1.5
+                } else {
+                    1.0
+                },
+                radius: 10.0.into(),
+            },
+            icon: self.on_surface_var,
+            placeholder: self.on_surface_var,
+            value: self.on_surface,
+            selection: self.primary_container,
+        }
+    }
+
+    fn slider_style(&self, status: slider::Status) -> slider::Style {
+        let handle_bg = match status {
+            slider::Status::Hovered | slider::Status::Dragged => self.primary_container,
+            _ => self.primary,
+        };
+        let handle_border = match status {
+            slider::Status::Hovered | slider::Status::Dragged => self.primary,
+            _ => self.background,
+        };
+
+        slider::Style {
+            rail: slider::Rail {
+                backgrounds: (
+                    Background::Color(self.primary),
+                    Background::Color(self.surface_highest),
+                ),
+                width: 5.0,
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 3.0.into(),
+                },
+            },
+            handle: slider::Handle {
+                shape: slider::HandleShape::Circle { radius: 8.0 },
+                background: Background::Color(handle_bg),
+                border_width: 1.5,
+                border_color: handle_border,
+            },
+        }
+    }
+
+    fn pick_list_style(&self, status: pick_list::Status) -> pick_list::Style {
+        let border_color = match status {
+            pick_list::Status::Hovered | pick_list::Status::Opened => self.primary,
+            _ => self.outline,
+        };
+        pick_list::Style {
+            text_color: self.on_surface,
+            placeholder_color: self.on_surface_var,
+            handle_color: self.on_surface_var,
+            background: Background::Color(self.surface_high),
+            border: Border {
+                color: border_color,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+        }
+    }
+
+    fn checkbox_style(&self, status: checkbox::Status) -> checkbox::Style {
+        let (is_checked, is_hovered) = match status {
+            checkbox::Status::Active { is_checked } => (is_checked, false),
+            checkbox::Status::Hovered { is_checked } => (is_checked, true),
+            checkbox::Status::Disabled { is_checked } => (is_checked, false),
+        };
+        checkbox::Style {
+            background: Background::Color(if is_checked {
+                self.primary
+            } else {
+                self.surface_high
+            }),
+            icon_color: self.on_primary,
+            border: Border {
+                color: if is_checked || is_hovered {
+                    self.primary
+                } else {
+                    self.outline
+                },
+                width: 1.2,
+                radius: 5.0.into(),
+            },
+            text_color: Some(self.on_surface),
+        }
     }
 }
 
@@ -1264,6 +2270,11 @@ pub fn run_settings_window(config_path: PathBuf, runtime_json_path: PathBuf) -> 
         SettingsGui::update,
         SettingsGui::view,
     )
+    .window(iced::window::Settings {
+        size: Size::new(960.0, 680.0),
+        min_size: Some(Size::new(360.0, 420.0)),
+        ..Default::default()
+    })
     .theme(SettingsGui::theme)
     .run_with(move || {
         (
@@ -1352,7 +2363,8 @@ mod tests {
         let _ = gui.update(GuiMessage::PlasmaModeChanged(ThemeMode::Light));
         assert!(!gui.config.plasma_follows_scheme);
         assert_eq!(gui.config.light, Some(true));
-        assert_eq!(gui.theme(), Theme::Light);
+        assert!(gui.is_light_theme());
+        assert!(gui.has_unsaved_changes);
 
         let _ = gui.update(GuiMessage::PlasmaModeChanged(ThemeMode::FollowScheme));
         assert!(gui.config.plasma_follows_scheme);
@@ -1481,5 +2493,44 @@ mod tests {
         assert!(gui.config.fetch_colors);
         assert!(cfg_path.exists());
         assert!(gui.reload_trigger_path().exists());
+    }
+
+    #[test]
+    fn test_gui_theme_mode_and_editable_multiplier_inputs() {
+        let dir = tempdir().expect("create tempdir");
+        let cfg_path = dir.path().join("config.conf");
+        let json_path = dir.path().join("runtime.json");
+
+        let mut gui = SettingsGui::new_with_paths(cfg_path, json_path);
+        assert_eq!(gui.gui_theme_mode, GuiThemeMode::System);
+
+        // System mode follows `system_light` (detected from kdeglobals)
+        gui.system_light = true;
+        assert!(gui.is_light_theme());
+        gui.system_light = false;
+        assert!(!gui.is_light_theme());
+
+        // Explicit Light / Dark GUI theme mode overrides `system_light`
+        let _ = gui.update(GuiMessage::GuiThemeModeChanged(GuiThemeMode::Light));
+        assert!(gui.is_light_theme());
+        gui.system_light = true;
+        let _ = gui.update(GuiMessage::GuiThemeModeChanged(GuiThemeMode::Dark));
+        assert!(!gui.is_light_theme());
+        let _ = gui.update(GuiMessage::GuiThemeModeChanged(GuiThemeMode::System));
+        assert!(gui.is_light_theme());
+
+        // Editable multiplier inputs update config + clamp + sync on reset
+        let _ = gui.update(GuiMessage::ChromaInputChanged("1.73".to_string()));
+        assert!((gui.config.chroma_multiplier - 1.73).abs() < 1e-6);
+        assert_eq!(gui.chroma_input, "1.73");
+        let _ = gui.update(GuiMessage::ResetChromaMultiplier);
+        assert!((gui.config.chroma_multiplier - 1.0).abs() < 1e-6);
+        assert_eq!(gui.chroma_input, "1.00");
+
+        let _ = gui.update(GuiMessage::ContrastInputChanged("-0.35".to_string()));
+        assert!((gui.config.contrast_level - (-0.35)).abs() < 1e-6);
+        let _ = gui.update(GuiMessage::ResetContrastLevel);
+        assert!((gui.config.contrast_level - 0.0).abs() < 1e-6);
+        assert_eq!(gui.contrast_input, "0.00");
     }
 }
